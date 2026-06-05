@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  dbsync:
+    build: .
+    container_name: dbsync
+    ports:
+      - "8000:8000"
+    volumes:
+      - dbsync-data:/app/data
+      - dbsync-backups:/app/backups
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8000
+      - DEBUG=false
+      - SECRET_KEY=$change-this-to-a-random-secret-key
+    restart: unless-stopped
+    networks:
+      - dbsync-net
+
+volumes:
+  dbsync-data:
+    driver: local
+  dbsync-backups:
+    driver: local
+
+networks:
+  dbsync-net:
+    driver: bridge
