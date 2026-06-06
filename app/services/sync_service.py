@@ -486,7 +486,8 @@ class SyncService:
                 'port': source_db.port,
                 'user': source_db.username,
                 'password': decrypt(source_db.password),
-                'database': source_db.database_name
+                'database': source_db.database_name,
+                'ssl_disabled': True  # 禁用 SSL（避免自签名证书问题）
             }
 
             target_config = {
@@ -494,7 +495,8 @@ class SyncService:
                 'port': target_db.port,
                 'user': target_db.username,
                 'password': decrypt(target_db.password),
-                'database': target_db.database_name
+                'database': target_db.database_name,
+                'ssl_disabled': True  # 禁用 SSL（避免自签名证书问题）
             }
             
             sync = MySQLBinlogSync(task_id, source_config, target_config)

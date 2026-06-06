@@ -292,10 +292,9 @@ async def full_copy_database(
             '--events',
             '--hex-blob',                       # 以十六进制格式处理 BLOB/BINARY 列
             '--default-character-set=utf8mb4',  # 指定字符集
-            '--column-statistics=0',            # 兼容 MySQL 8.0+ (禁用列统计)
-            '--set-gtid-purged=OFF',            # 禁用 GTID 相关语句
             '--complete-insert',                # 生成完整 INSERT 语句（包含列名）
             '--skip-lock-tables',               # 不锁定表
+            '--skip-ssl',                       # 跳过 SSL（避免自签名证书问题）
             source_db.database_name
         ]
         

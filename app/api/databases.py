@@ -220,7 +220,8 @@ async def test_connection(request: TestConnectionRequest):
             user=request.username,
             password=request.password,
             database=request.database_name,
-            connect_timeout=5
+            connect_timeout=5,
+            ssl_disabled=True  # 禁用 SSL（避免自签名证书问题）
         )
         connection.close()
         return {"success": True, "message": "连接成功"}

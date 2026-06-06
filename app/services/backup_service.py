@@ -63,7 +63,8 @@ class MySQLBackup:
                 port=self.database_config['port'],
                 user=self.database_config['username'],
                 password=self.database_config['password'],
-                database=self.database_config['database']
+                database=self.database_config['database'],
+                ssl_disabled=True  # 禁用 SSL（避免自签名证书问题）
             )
             conn.close()
         except Exception as e:
@@ -230,6 +231,7 @@ class MySQLBackup:
                 '--routines',
                 '--triggers',
                 '--events',
+                '--skip-ssl',                   # 跳过 SSL（避免自签名证书问题）
                 self.database_config['database']
             ]
             
@@ -290,6 +292,7 @@ class MySQLBackup:
                 f'--user={self.database_config["username"]}',
                 f'--password={self.database_config["password"]}',
                 '--read-from-remote-server',
+                '--skip-ssl',                   # 跳过 SSL（避免自签名证书问题）
                 f'--start-datetime={start_time.strftime("%Y-%m-%d %H:%M:%S")}',
                 f'--stop-datetime={stop_time.strftime("%Y-%m-%d %H:%M:%S")}',
                 binlog_file

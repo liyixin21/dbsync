@@ -1,4 +1,4 @@
-ervices:
+services:
   dbsync:
     build: .
     container_name: dbsync
@@ -7,11 +7,13 @@ ervices:
     volumes:
       - dbsync-data:/app/data
       - dbsync-backups:/app/backups
+      - /etc/localtime:/etc/localtime:ro  # 同步宿主机时区
     environment:
       - HOST=0.0.0.0
       - PORT=8000
       - DEBUG=false
       - SECRET_KEY=change-this-to-a-random-secret-key
+      - TZ=Asia/Shanghai  # 设置时区为北京时间
     restart: unless-stopped
     networks:
       - dbsync-net
