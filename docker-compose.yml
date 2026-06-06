@@ -5,8 +5,8 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - dbsync-data:/app/data
-      - dbsync-backups:/app/backups
+      - ./data:/app/data
+      - ./backups:/app/backups
       - /etc/localtime:/etc/localtime:ro  # 同步宿主机时区
     environment:
       - HOST=0.0.0.0
@@ -17,12 +17,6 @@ services:
     restart: unless-stopped
     networks:
       - dbsync-net
-
-volumes:
-  dbsync-data:
-    driver: local
-  dbsync-backups:
-    driver: local
 
 networks:
   dbsync-net:

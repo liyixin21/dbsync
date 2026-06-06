@@ -307,6 +307,7 @@ async def full_copy_database(
             f'--password={target_password}',
             '--default-character-set=utf8mb4',  # 指定字符集
             '--force',                          # 遇到错误继续执行
+            '--skip-ssl',                       # 跳过 SSL（避免自签名证书问题）
             '--init-command=SET FOREIGN_KEY_CHECKS=0, UNIQUE_CHECKS=0',  # 禁用检查提高导入速度和可靠性
             target_db.database_name
         ]
