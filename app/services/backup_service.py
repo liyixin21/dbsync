@@ -111,19 +111,26 @@ class MySQLBackup:
                 # 使用 schedule 在计算出的时间点运行
                 self.scheduler.every(delay_seconds).seconds.do(self._execute_and_reschedule)
                 self._cron_expr = cron
+                self._last_scheduled_run = now  # 记录调度基准时间
                 logger.info(f"备份计划 {self.plan_id} cron='{cron}' 下次运行: {next_run}")
             else:
                 logger.error(f"备份计划 {self.plan_id} cron 表达式无效: {cron}")
 
     def _execute_and_reschedule(self):
-        """执行备份后重新调度下一次（用于 cron 模式）"""
+        """执行备份后重新调度下一次（用于 cron 模式，避免时间漂移）"""
         self._execute_backup()
-        # 重新计算下次运行时间
+        # 基于上次调度时间计算下一次运行，避免因备份耗时而漂移
         if hasattr(self, '_cron_expr'):
-            now = datetime.now()
-            cron_itr = croniter(self._cron_expr, now)
+            # 使用上次调度时间计算下次运行，而非当前时间
+            base_time = self._last_scheduled_run if hasattr(self, '_last_scheduled_run') else datetime.now()
+            cron_itr = croniter(self._cron_expr, base_time)
             next_run = cron_itr.get_next(datetime)
-            delay_seconds = (next_run - now).total_seconds()
+            # 如果计算出的下次时间已过（可能性很小），用当前时间重算
+            if next_run <= datetime.now():
+                cron_itr = croniter(self._cron_expr, datetime.now())
+                next_run = cron_itr.get_next(datetime)
+            delay_seconds = max(1, (next_run - datetime.now()).total_seconds())
+            self._last_scheduled_run = next_run
             self.scheduler.clear()
             self.scheduler.every(delay_seconds).seconds.do(self._execute_and_reschedule)
             logger.info(f"备份计划 {self.plan_id} 下次运行: {next_run}")
@@ -219,21 +226,22 @@ class MySQLBackup:
             # 确保备份目录存在
             os.makedirs(os.path.dirname(backup_path), exist_ok=True)
             
-            # 构建mysqldump命令
+            # 构建mysqldump命令（密码通过环境变量传递，避免在进程列表中暴露）
             mysqldump_path = _find_mysql_tool('mysqldump')
             cmd = [
                 mysqldump_path,
                 f'--host={self.database_config["host"]}',
                 f'--port={self.database_config["port"]}',
                 f'--user={self.database_config["username"]}',
-                f'--password={self.database_config["password"]}',
                 '--single-transaction',
                 '--routines',
                 '--triggers',
                 '--events',
-                '--skip-ssl',                   # 跳过 SSL（避免自签名证书问题）
+                '--ssl-mode=DISABLED',          # 跳过 SSL（兼容新旧 MySQL 客户端）
                 self.database_config['database']
             ]
+            
+            dump_env = {**os.environ, 'MYSQL_PWD': self.database_config['password']}
             
             # 执行备份
             with open(backup_path, 'w') as f:
@@ -242,7 +250,8 @@ class MySQLBackup:
                     stdout=f,
                     stderr=subprocess.PIPE,
                     text=True,
-                    timeout=3600  # 1小时超时
+                    timeout=3600,  # 1小时超时
+                    env=dump_env
                 )
             
             if result.returncode == 0:
@@ -273,10 +282,10 @@ class MySQLBackup:
             backup_path = os.path.join(self.backup_config['backup_dir'], filename)
             os.makedirs(os.path.dirname(backup_path), exist_ok=True)
 
-            # 动态获取当前 binlog 文件名
-            binlog_file = self._get_current_binlog_file()
-            if not binlog_file:
-                error_msg = "无法获取当前 binlog 文件，请确认源数据库已启用 binlog 且连接正常"
+            # 获取所有 binlog 文件列表（覆盖 binlog 轮转场景）
+            binlog_files = self._get_all_binlog_files()
+            if not binlog_files:
+                error_msg = "无法获取 binlog 文件列表，请确认源数据库已启用 binlog 且连接正常"
                 logger.error(error_msg)
                 return False, error_msg
 
@@ -285,26 +294,39 @@ class MySQLBackup:
             stop_time = now_beijing()
 
             mysqlbinlog_path = _find_mysql_tool('mysqlbinlog')
-            cmd = [
-                mysqlbinlog_path,
-                f'--host={self.database_config["host"]}',
-                f'--port={self.database_config["port"]}',
-                f'--user={self.database_config["username"]}',
-                f'--password={self.database_config["password"]}',
-                '--read-from-remote-server',
-                '--skip-ssl',                   # 跳过 SSL（避免自签名证书问题）
-                f'--start-datetime={start_time.strftime("%Y-%m-%d %H:%M:%S")}',
-                f'--stop-datetime={stop_time.strftime("%Y-%m-%d %H:%M:%S")}',
-                binlog_file
-            ]
+            backup_env = {**os.environ, 'MYSQL_PWD': self.database_config['password']}
 
-            with open(backup_path, 'w') as f:
-                result = subprocess.run(
-                    cmd, stdout=f, stderr=subprocess.PIPE,
-                    text=True, timeout=3600
-                )
+            # 遍历所有 binlog 文件，逐个导出时间范围内的变更
+            backup_success = True
+            backup_error = None
+            first_file = True
+            for binlog_file in binlog_files:
+                cmd = [
+                    mysqlbinlog_path,
+                    f'--host={self.database_config["host"]}',
+                    f'--port={self.database_config["port"]}',
+                    f'--user={self.database_config["username"]}',
+                    '--read-from-remote-server',
+                    '--ssl-mode=DISABLED',
+                    f'--start-datetime={start_time.strftime("%Y-%m-%d %H:%M:%S")}',
+                    f'--stop-datetime={stop_time.strftime("%Y-%m-%d %H:%M:%S")}',
+                    binlog_file
+                ]
 
-            if result.returncode == 0:
+                mode = 'w' if first_file else 'a'
+                first_file = False
+                with open(backup_path, mode) as f:
+                    result = subprocess.run(
+                        cmd, stdout=f, stderr=subprocess.PIPE,
+                        text=True, timeout=3600, env=backup_env
+                    )
+                if result.returncode != 0:
+                    error_msg = result.stderr.strip() if result.stderr else f"mysqlbinlog 退出码: {result.returncode}"
+                    logger.warning(f"binlog 文件 {binlog_file} 导出有警告: {error_msg}")
+                    backup_error = error_msg
+                    backup_success = False
+
+            if backup_success:
                 db = SessionLocal()
                 history = db.query(BackupHistory).filter(BackupHistory.id == history_id).first()
                 if history:
@@ -314,13 +336,38 @@ class MySQLBackup:
                 logger.info(f"增量备份成功: {backup_path}")
                 return True, None
             else:
-                error_msg = result.stderr.strip() if result.stderr else f"mysqlbinlog 退出码: {result.returncode}"
-                logger.error(f"增量备份失败: {error_msg}")
-                return False, error_msg
+                logger.error(f"增量备份完成但有错误: {backup_error}")
+                return False, backup_error
 
         except Exception as e:
             logger.error(f"增量备份异常: {e}")
             return False, str(e)
+
+    def _get_all_binlog_files(self) -> list:
+        """获取所有 binlog 文件列表（兼容 MySQL 5.7/8.0/8.4+），按时间排序"""
+        try:
+            import mysql.connector
+            conn = mysql.connector.connect(
+                host=self.database_config['host'],
+                port=self.database_config['port'],
+                user=self.database_config['username'],
+                password=self.database_config['password'],
+                database=self.database_config['database']
+            )
+            cursor = conn.cursor()
+            cursor.execute("SHOW BINARY LOGS")
+            rows = cursor.fetchall()
+            cursor.close()
+            conn.close()
+            if rows:
+                return [row[0] for row in rows]
+            # SHOW BINARY LOGS 不可用，回退到当前文件
+            fallback = self._get_current_binlog_file()
+            return [fallback] if fallback else []
+        except Exception as e:
+            logger.warning(f"获取 binlog 文件列表失败: {e}")
+            fallback = self._get_current_binlog_file()
+            return [fallback] if fallback else []
 
     def _get_current_binlog_file(self) -> Optional[str]:
         """获取当前 binlog 文件名（兼容 MySQL 5.7/8.0/8.4+）"""

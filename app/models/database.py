@@ -1,7 +1,7 @@
 """
 数据库模型定义
 """
-from sqlalchemy import Column, Integer, String, Boolean, DateTime, Text, Enum, ForeignKey, JSON
+from sqlalchemy import Column, Integer, BigInteger, String, Boolean, DateTime, Text, Enum, ForeignKey, JSON
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship
 from datetime import datetime
@@ -113,7 +113,7 @@ class BackupHistory(Base):
     status = Column(Enum(BackupStatus), default=BackupStatus.PENDING, comment="备份状态")
     backup_type = Column(Enum(BackupType), nullable=False, comment="备份类型")
     file_path = Column(String(500), comment="备份文件路径")
-    file_size = Column(Integer, comment="文件大小(字节)")
+    file_size = Column(BigInteger, comment="文件大小(字节)")
     start_time = Column(DateTime, comment="开始时间")
     end_time = Column(DateTime, comment="结束时间")
     duration = Column(Integer, comment="耗时(秒)")
@@ -150,6 +150,7 @@ class User(Base):
     username = Column(String(50), nullable=False, unique=True, comment="用户名")
     password_hash = Column(String(255), nullable=False, comment="密码哈希")
     is_active = Column(Boolean, default=True, comment="是否启用")
+    token_version = Column(Integer, default=0, comment="令牌版本号，修改密码/用户名时递增以使旧令牌失效")
     created_at = Column(DateTime, default=now_beijing, comment="创建时间")
     last_login = Column(DateTime, comment="最后登录时间")
     

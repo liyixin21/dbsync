@@ -70,7 +70,8 @@ class TestConnectionRequest(BaseModel):
 async def list_databases(
     skip: int = 0,
     limit: int = 100,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     """获取数据库列表"""
     databases = db.query(Database).offset(skip).limit(limit).all()
@@ -86,7 +87,7 @@ async def list_databases(
 
 
 @router.get("/{database_id}", response_model=DatabaseResponse)
-async def get_database(database_id: int, db: Session = Depends(get_db)):
+async def get_database(database_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """获取单个数据库信息"""
     d = db.query(Database).filter(Database.id == database_id).first()
     if not d:

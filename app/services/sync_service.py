@@ -21,18 +21,23 @@ from ..models.database import SyncTask, SyncStatus, Database, RunLog
 class MySQLBinlogSync:
     """MySQL Binlog 同步实现（基于 mysql-replication 库）"""
 
-    def __init__(self, task_id: int, source_config: dict, target_config: dict):
+    def __init__(self, task_id: int, source_config: dict, target_config: dict,
+                 initial_file: str = None, initial_pos: int = None):
         self.task_id = task_id
         self.source_config = source_config
         self.target_config = target_config
         self.running = False
         self.thread: Optional[threading.Thread] = None
         self.target_conn: Optional[mysql.connector.MySQLConnection] = None
-        self.binlog_file: Optional[str] = None
-        self.binlog_pos: Optional[int] = None
+        self.binlog_file: Optional[str] = initial_file
+        self.binlog_pos: Optional[int] = initial_pos
         self._sync_count = 0
         # 列名缓存: {(database, table): [col1, col2, ...]}
         self._column_cache: Dict[tuple, List[str]] = {}
+        # 已记录映射的表（避免重复刷日志）
+        self._mapped_tables: set = set()
+        # 目标库不存在的表（避免无休止重试）
+        self._missing_tables: set = set()
         # 源数据库连接（用于查询列名）
         self._source_conn: Optional[mysql.connector.MySQLConnection] = None
 
@@ -65,12 +70,14 @@ class MySQLBinlogSync:
         self._write_run_log("INFO", "同步任务已启动")
 
     def stop(self):
-        """停止同步"""
+        """停止同步（保存当前位置以便下次恢复）"""
         self.running = False
         if self.thread:
             self.thread.join(timeout=5)
+        # 保存当前 binlog 位置到数据库，便于下次恢复时从中断点继续
+        self._save_position()
         self._close_connections()
-        logger.info(f"同步任务 {self.task_id} 已停止")
+        logger.info(f"同步任务 {self.task_id} 已停止 (位置: {self.binlog_file}@{self.binlog_pos})")
         self._write_run_log("INFO", "同步任务已停止")
 
     def _sync_loop(self):
@@ -158,7 +165,27 @@ class MySQLBinlogSync:
 
         # 值字典使用整数键（0, 1, 2, ...）或 UNKNOWN_COL 前缀
         mapped = {}
-        sorted_keys = sorted(values.keys(), key=lambda k: int(k) if isinstance(k, int) else int(str(k).lstrip("UNKNOWN_COL_").lstrip("UNKNOWN_COL")))
+        def _extract_index(k):
+            """从整数键或 UNKNOWN_COL_N 格式的键中提取列索引"""
+            if isinstance(k, int):
+                return k
+            s = str(k)
+            if s.startswith("UNKNOWN_COL_"):
+                try:
+                    return int(s[len("UNKNOWN_COL_"):])
+                except ValueError:
+                    pass
+            if s.startswith("UNKNOWN_COL"):
+                try:
+                    return int(s[len("UNKNOWN_COL"):])
+                except ValueError:
+                    pass
+            # 尝试直接转换整数
+            try:
+                return int(s)
+            except ValueError:
+                return 0
+        sorted_keys = sorted(values.keys(), key=_extract_index)
         for i, key in enumerate(sorted_keys):
             if i < len(columns):
                 mapped[columns[i]] = values[key]
@@ -168,14 +195,17 @@ class MySQLBinlogSync:
         return mapped
 
     def _get_initial_position(self):
-        """获取初始 binlog 位置（兼容 MySQL 5.7/8.0/8.4+）"""
+        """获取初始 binlog 位置"""
+        # 如果已有保存的位置（从上次停止恢复），直接使用
+        if self.binlog_file and self.binlog_pos is not None:
+            logger.info(f"同步任务 {self.task_id} 从保存位置恢复: {self.binlog_file}@{self.binlog_pos}")
+            return
+
+        # 否则从源库获取当前最新位置
         try:
             conn = mysql.connector.connect(**self.source_config)
             cursor = conn.cursor()
             
-            # MySQL 8.4+ 移除了 SHOW MASTER STATUS，使用 SHOW BINARY LOG STATUS
-            # MySQL 8.0.22 引入了 SHOW BINARY LOG STATUS 但仍支持旧命令
-            # MySQL 5.7 只支持 SHOW MASTER STATUS
             row = None
             for sql in ("SHOW BINARY LOG STATUS", "SHOW MASTER STATUS"):
                 try:
@@ -192,7 +222,7 @@ class MySQLBinlogSync:
             if row:
                 self.binlog_file = row[0]
                 self.binlog_pos = row[1]
-                logger.info(f"同步任务 {self.task_id} 初始位置: {self.binlog_file}@{self.binlog_pos}")
+                logger.info(f"同步任务 {self.task_id} 初始位置(最新): {self.binlog_file}@{self.binlog_pos}")
             else:
                 raise Exception("无法获取 binlog 位置，请确认源数据库已启用 binlog")
         except Error as e:
@@ -243,7 +273,8 @@ class MySQLBinlogSync:
                     # DDL 语句（CREATE TABLE, ALTER TABLE 等）
                     query = binlog_event.query.strip()
                     if query.upper().startswith(('CREATE', 'ALTER', 'DROP', 'RENAME', 'TRUNCATE')):
-                        self._replicate_ddl(query)
+                        database = binlog_event.schema if hasattr(binlog_event, 'schema') else None
+                        self._replicate_ddl(query, database=database)
                         self._write_run_log("INFO", f"DDL 同步: {query[:200]}", detail=query)
                     continue
 
@@ -253,10 +284,16 @@ class MySQLBinlogSync:
 
                 # 每100条事件更新一次状态并记录日志
                 if self._sync_count % 100 == 0:
-                    self._update_task_status(SyncStatus.RUNNING)
+                    # 计算同步延迟（基于事件时间戳）
+                    import time as _time
+                    if hasattr(binlog_event, 'timestamp'):
+                        delay_ms = int((_time.time() - binlog_event.timestamp) * 1000)
+                    else:
+                        delay_ms = 0
+                    self._update_task_status(SyncStatus.RUNNING, sync_delay=delay_ms)
                     self.binlog_pos = binlog_event.packet.log_pos
-                    self._write_run_log("INFO", f"已同步 {self._sync_count} 条事件, 当前位置: {self.binlog_file}@{self.binlog_pos}")
-                    logger.info(f"同步任务 {self.task_id} 已同步 {self._sync_count} 条事件")
+                    self._write_run_log("INFO", f"已同步 {self._sync_count} 条事件, 延迟: {delay_ms}ms, 当前位置: {self.binlog_file}@{self.binlog_pos}")
+                    logger.info(f"同步任务 {self.task_id} 已同步 {self._sync_count} 条事件, 延迟 {delay_ms}ms")
 
         except Exception as e:
             logger.error(f"同步任务 {self.task_id} binlog 监听异常: {e}")
@@ -270,6 +307,10 @@ class MySQLBinlogSync:
         table = event.table
         database = event.schema
 
+        # 跳过目标库不存在的表（避免无休止重试）
+        if self._should_skip(database, table):
+            return
+
         if isinstance(event, WriteRowsEvent):
             for row in event.rows:
                 # pymysqlreplication 返回的 row 结构: {"values": {col: val, ...}, "none_sources": {...}}
@@ -279,7 +320,10 @@ class MySQLBinlogSync:
                     columns = self._get_column_names(database, table)
                     if columns:
                         values = self._map_values_to_columns(values, columns)
-                        logger.debug(f"已将 {database}.{table} 的列名映射为: {list(values.keys())}")
+                        table_key = (database, table)
+                        if table_key not in self._mapped_tables:
+                            self._mapped_tables.add(table_key)
+                            logger.info(f"已将 {database}.{table} 的列名映射为: {list(values.keys())}")
                 self._replicate_insert(database, table, values)
             if self._sync_count == 0:
                 self._write_run_log("INFO", f"收到首个 INSERT 事件: {database}.{table}")
@@ -320,33 +364,74 @@ class MySQLBinlogSync:
         self._execute_on_target(sql, list(row.values()))
 
     def _replicate_update(self, database: str, table: str, before: dict, after: dict):
-        """将 UPDATE 事件同步到目标数据库"""
+        """将 UPDATE 事件同步到目标数据库（正确处理 NULL 值）"""
         set_clause = ", ".join(f"`{k}` = %s" for k in after.keys())
-        where_clause = " AND ".join(f"`{k}` = %s" for k in before.keys())
+        where_parts = []
+        where_params = []
+        for k, v in before.items():
+            if v is None:
+                where_parts.append(f"`{k}` IS NULL")
+            else:
+                where_parts.append(f"`{k}` = %s")
+                where_params.append(v)
+        where_clause = " AND ".join(where_parts) if where_parts else "1=1"
         sql = f"UPDATE `{database}`.`{table}` SET {set_clause} WHERE {where_clause}"
-        params = list(after.values()) + list(before.values())
+        params = list(after.values()) + where_params
         self._execute_on_target(sql, params)
 
     def _replicate_delete(self, database: str, table: str, row: dict):
-        """将 DELETE 事件同步到目标数据库"""
-        where_clause = " AND ".join(f"`{k}` = %s" for k in row.keys())
+        """将 DELETE 事件同步到目标数据库（正确处理 NULL 值）"""
+        where_parts = []
+        where_params = []
+        for k, v in row.items():
+            if v is None:
+                where_parts.append(f"`{k}` IS NULL")
+            else:
+                where_parts.append(f"`{k}` = %s")
+                where_params.append(v)
+        where_clause = " AND ".join(where_parts) if where_parts else "1=1"
         sql = f"DELETE FROM `{database}`.`{table}` WHERE {where_clause}"
-        self._execute_on_target(sql, list(row.values()))
+        self._execute_on_target(sql, where_params)
 
-    def _replicate_ddl(self, query: str):
-        """将 DDL 语句同步到目标数据库"""
+    def _replicate_ddl(self, query: str, database: str = None, table: str = None):
+        """将 DDL 语句同步到目标数据库，并清除相关表的列名缓存"""
         try:
             cursor = self.target_conn.cursor()
             cursor.execute(query)
             self.target_conn.commit()
             cursor.close()
+            # DDL 可能改变表结构，清除相关缓存
+            if database and table:
+                cache_key = (database, table)
+                if cache_key in self._column_cache:
+                    del self._column_cache[cache_key]
+                if cache_key in self._mapped_tables:
+                    self._mapped_tables.discard(cache_key)
+                if cache_key in self._missing_tables:
+                    self._missing_tables.discard(cache_key)
+                    logger.info(f"同步任务 {self.task_id} 表 {database}.{table} 已重新创建，恢复同步")
+            elif database:
+                keys_to_remove = [k for k in self._column_cache if k[0] == database]
+                for k in keys_to_remove:
+                    del self._column_cache[k]
+                self._mapped_tables = {k for k in self._mapped_tables if k[0] != database}
+                self._missing_tables = {k for k in self._missing_tables if k[0] != database}
             logger.info(f"同步任务 {self.task_id} DDL 同步成功: {query[:100]}")
         except Exception as e:
             logger.warning(f"同步任务 {self.task_id} DDL 同步失败（跳过）: {e}")
             self._write_run_log("WARNING", f"DDL 同步失败（已跳过）: {str(e)[:200]}", detail=query)
 
+    def _should_skip(self, database: str, table: str) -> bool:
+        """检查目标表是否在缺失列表中"""
+        return (database, table) in self._missing_tables
+
     def _execute_on_target(self, sql: str, params: list):
-        """在目标数据库执行 SQL"""
+        """在目标数据库执行 SQL（永久性错误不重试）"""
+        # 从 SQL 中提取 database.table 用于错误去重
+        import re
+        m = re.search(r'(?:INTO|FROM|UPDATE)\s+`([^`]+)`\.`([^`]+)`', sql, re.IGNORECASE)
+        db_table = (m.group(1), m.group(2)) if m else None
+
         try:
             if not self.target_conn or not self.target_conn.is_connected():
                 self._connect_target()
@@ -355,10 +440,20 @@ class MySQLBinlogSync:
             self.target_conn.commit()
             cursor.close()
         except Exception as e:
-            error_detail = f"SQL: {sql[:200]}... | 参数: {str(params)[:200]} | 错误: {e}"
-            logger.error(f"同步任务 {self.task_id} 目标数据库执行失败: {error_detail}")
-            self._write_run_log("ERROR", f"目标数据库执行失败: {str(e)[:200]}", detail=error_detail)
-            # 尝试重连后重试一次
+            err_str = str(e)
+            # 永久性错误：不重试，记一次日志并跳过后续同类操作
+            is_permanent = any(kw in err_str for kw in (
+                "doesn't exist", "does not exist", "Duplicate column",
+                "Unknown column", "Duplicate key", "Duplicate entry",
+            ))
+            if is_permanent and db_table:
+                if db_table not in self._missing_tables:
+                    self._missing_tables.add(db_table)
+                    logger.error(f"同步任务 {self.task_id} 目标库表不存在: {db_table[0]}.{db_table[1]}, 原因: {err_str[:100]}")
+                return  # 永久性错误，直接跳过
+
+            # 临时性错误：重连后重试一次
+            logger.warning(f"同步任务 {self.task_id} 执行失败，尝试重连: {err_str[:100]}")
             try:
                 self._connect_target()
                 cursor = self.target_conn.cursor()
@@ -366,11 +461,25 @@ class MySQLBinlogSync:
                 self.target_conn.commit()
                 cursor.close()
             except Exception as retry_err:
-                retry_detail = f"SQL: {sql[:200]}... | 重试错误: {retry_err}"
-                logger.error(f"同步任务 {self.task_id} 重试执行失败: {retry_detail}")
-                self._write_run_log("ERROR", f"重试执行失败: {str(retry_err)[:200]}", detail=retry_detail)
+                logger.error(f"同步任务 {self.task_id} 重试失败: {str(retry_err)[:100]}")
+                self._write_run_log("ERROR", f"目标数据库执行失败: {str(retry_err)[:200]}")
 
-    def _update_task_status(self, status: SyncStatus, error_message: str = None):
+    def _save_position(self):
+        """保存当前 binlog 位置到数据库"""
+        if not self.binlog_file or self.binlog_pos is None:
+            return
+        try:
+            db = SessionLocal()
+            task = db.query(SyncTask).filter(SyncTask.id == self.task_id).first()
+            if task:
+                task.binlog_file = self.binlog_file
+                task.binlog_position = str(self.binlog_pos)
+                db.commit()
+            db.close()
+        except Exception as e:
+            logger.error(f"保存 binlog 位置失败: {e}")
+
+    def _update_task_status(self, status: SyncStatus, error_message: str = None, sync_delay: int = None):
         """更新任务状态"""
         try:
             db = SessionLocal()
@@ -378,7 +487,10 @@ class MySQLBinlogSync:
             if task:
                 task.status = status
                 task.last_sync_time = now_beijing()
-                task.sync_delay = self._sync_count
+                if sync_delay is not None:
+                    task.sync_delay = sync_delay
+                elif status != SyncStatus.RUNNING:
+                    task.sync_delay = 0
                 if self.binlog_file:
                     task.binlog_file = self.binlog_file
                 if self.binlog_pos:
@@ -499,7 +611,11 @@ class SyncService:
                 'ssl_disabled': True  # 禁用 SSL（避免自签名证书问题）
             }
             
-            sync = MySQLBinlogSync(task_id, source_config, target_config)
+            # 如果有保存的 binlog 位置，从中断点恢复（避免同步间隙）
+            saved_file = task.binlog_file if task.binlog_file else None
+            saved_pos = int(task.binlog_position) if task.binlog_position else None
+            sync = MySQLBinlogSync(task_id, source_config, target_config,
+                                   initial_file=saved_file, initial_pos=saved_pos)
             self.sync_tasks[task_id] = sync
             
             # 启动同步

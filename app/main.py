@@ -2,7 +2,6 @@
 FastAPI应用入口
 """
 import os
-import sys
 import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
@@ -14,7 +13,7 @@ import uvicorn
 from loguru import logger
 
 from .core.config import settings
-from .core.database import init_db, async_init_db, SessionLocal
+from .core.database import async_init_db, SessionLocal
 from .core.services import sync_service, backup_service
 from .api import api_router
 
@@ -34,49 +33,30 @@ logger.add(
 
 
 def create_default_admin():
-    """创建或恢复默认管理员账户（幂等）"""
+    """仅在没有任何用户时创建默认管理员账户（幂等，不会重置已有密码）"""
     from .models.database import User
     from passlib.context import CryptContext
     
     pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
     db = SessionLocal()
     try:
-        # 查找 admin 用户
-        admin = db.query(User).filter(User.username == "admin").first()
-        if admin is None:
-            # admin 不存在：检查是否有其他用户（可能被测试脚本改名了）
-            # 尝试找到一个不活跃或孤立的用户来恢复
-            # 如果没有任何用户，直接创建
-            user_count = db.query(User).count()
-            if user_count == 0:
-                admin = User(
-                    username="admin",
-                    password_hash=pwd_context.hash("admin123"),
-                    is_active=True
-                )
-                db.add(admin)
-                db.commit()
-                print("已创建默认管理员账户: admin / admin123")
-            else:
-                # 有其他用户但没有 admin，可能是测试脚本改名了
-                # 重置第一个用户的用户名为 admin
-                first_user = db.query(User).first()
-                if first_user:
-                    first_user.username = "admin"
-                    first_user.password_hash = pwd_context.hash("admin123")
-                    first_user.is_active = True
-                    db.commit()
-                    print("已恢复默认管理员账户: admin / admin123")
+        user_count = db.query(User).count()
+        if user_count == 0:
+            admin = User(
+                username="admin",
+                password_hash=pwd_context.hash("admin123"),
+                is_active=True
+            )
+            db.add(admin)
+            db.commit()
+            print("已创建默认管理员账户: admin / admin123")
+            print("  请尽快通过 WebUI 修改默认密码！")
         else:
-            # admin 存在，确保密码正确且账户启用
-            if not pwd_context.verify("admin123", admin.password_hash):
-                admin.password_hash = pwd_context.hash("admin123")
-                db.commit()
-                print("已重置管理员密码: admin123")
-            if not admin.is_active:
-                admin.is_active = True
-                db.commit()
-                print("已启用管理员账户")
+            # 已有用户，不做任何修改
+            admin = db.query(User).filter(User.username == "admin").first()
+            if admin is not None and admin.is_active == False:
+                # 仅恢复被禁用但不想丢失密码的情况：提示但不自动修改
+                print("管理员账户处于禁用状态，请在数据库中手动启用")
     finally:
         db.close()
 
@@ -90,17 +70,30 @@ async def lifespan(app: FastAPI):
     # 创建默认管理员
     create_default_admin()
     
-    # 启动同步服务
-    asyncio.create_task(sync_service.start())
+    # 启动同步服务（添加异常处理回调）
+    sync_task = asyncio.create_task(sync_service.start())
+    sync_task.add_done_callback(
+        lambda t: logger.error(f"同步服务异常退出: {t.exception()}") if t.exception() else None
+    )
     
-    # 启动备份服务
-    asyncio.create_task(backup_service.start())
+    # 启动备份服务（添加异常处理回调）
+    backup_task = asyncio.create_task(backup_service.start())
+    backup_task.add_done_callback(
+        lambda t: logger.error(f"备份服务异常退出: {t.exception()}") if t.exception() else None
+    )
     
     yield
     
-    # 关闭时停止服务
-    await sync_service.stop()
-    await backup_service.stop()
+    # 关闭时停止服务（处理 asyncio 取消异常）
+    try:
+        await sync_service.stop()
+    except asyncio.CancelledError:
+        pass
+    try:
+        await backup_service.stop()
+    except asyncio.CancelledError:
+        pass
+    logger.info("应用已关闭")
 
 
 # 创建FastAPI应用
@@ -115,7 +108,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )

@@ -47,7 +47,7 @@ class BackupHistoryListResponse(BaseModel):
 
 
 @router.get("/statistics")
-async def get_backup_statistics(db: Session = Depends(get_db)):
+async def get_backup_statistics(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """获取备份统计信息"""
     from sqlalchemy import func
     
@@ -94,7 +94,8 @@ async def list_backup_history(
     end_date: Optional[str] = None,
     skip: int = 0,
     limit: int = 50,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     """获取备份历史列表"""
     query = db.query(BackupHistory)
@@ -129,7 +130,7 @@ async def list_backup_history(
 
 
 @router.get("/{history_id}", response_model=BackupHistoryResponse)
-async def get_backup_history(history_id: int, db: Session = Depends(get_db)):
+async def get_backup_history(history_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """获取单个备份历史记录"""
     history = db.query(BackupHistory).filter(BackupHistory.id == history_id).first()
     if not history:
@@ -221,7 +222,7 @@ async def batch_delete_backup_history(
 
 
 @router.get("/{history_id}/download")
-async def download_backup_file(history_id: int, db: Session = Depends(get_db)):
+async def download_backup_file(history_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """下载备份文件"""
     history = db.query(BackupHistory).filter(BackupHistory.id == history_id).first()
     if not history:
@@ -312,19 +313,22 @@ async def restore_backup(
         logger.info(f"[Restore] 目标数据库: {target_db.host}:{target_db.port}/{target_db.database_name}")
         logger.info(f"[Restore] 备份文件: {history.file_path}")
         
+        # 通过环境变量传密码，避免在进程列表中暴露
+        import os as _os
+        restore_env = {**_os.environ, 'MYSQL_PWD': decrypt(target_db.password)}
+        
         cmd = [
             mysql_path,
             f'--host={target_db.host}',
             f'--port={target_db.port}',
             f'--user={target_db.username}',
-            f'--password={decrypt(target_db.password)}',
             target_db.database_name
         ]
 
         with open(history.file_path, 'r') as f:
             result = subprocess.run(
                 cmd, stdin=f, stderr=subprocess.PIPE,
-                text=True, timeout=3600
+                text=True, timeout=3600, env=restore_env
             )
 
         if result.returncode == 0:

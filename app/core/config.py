@@ -11,7 +11,7 @@ BEIJING_TZ = timezone(timedelta(hours=8))
 
 
 def now_beijing() -> datetime:
-    """获取北京时间（UTC+8）"""
+    """获取北京时间（UTC+8），返回 naive datetime（所有 DB 时间统一为北京时间）"""
     return datetime.now(BEIJING_TZ).replace(tzinfo=None)
 
 
@@ -45,6 +45,12 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
+    
+    def model_post_init(self, _context):
+        """配置加载后的校验"""
+        if self.SECRET_KEY == "change-me-in-production-env":
+            import sys
+            print("[WARNING] 正在使用默认 SECRET_KEY，请在 .env 或环境变量中设置一个随机密钥！", file=sys.stderr)
 
 
 # 创建全局配置实例

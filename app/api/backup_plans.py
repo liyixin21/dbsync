@@ -61,7 +61,8 @@ class BackupPlanResponse(BaseModel):
 async def list_backup_plans(
     skip: int = 0,
     limit: int = 100,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     """获取备份计划列表"""
     plans = db.query(BackupPlan).offset(skip).limit(limit).all()
@@ -69,7 +70,7 @@ async def list_backup_plans(
 
 
 @router.get("/{plan_id}", response_model=BackupPlanResponse)
-async def get_backup_plan(plan_id: int, db: Session = Depends(get_db)):
+async def get_backup_plan(plan_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """获取单个备份计划信息"""
     plan = db.query(BackupPlan).filter(BackupPlan.id == plan_id).first()
     if not plan:

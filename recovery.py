@@ -116,12 +116,13 @@ def find_backups(backup_dir: str, database: str) -> Tuple[List[dict], List[dict]
     return full_backups, incremental_backups
 
 
-def run_mysql_command(cmd: list, input_file: str = None, timeout: int = 3600) -> Tuple[bool, str]:
+def run_mysql_command(cmd: list, input_file: str = None, timeout: int = 3600, env: dict = None) -> Tuple[bool, str]:
     """
     执行 mysql 命令。
     返回 (成功标志, 错误信息)
     """
     try:
+        run_env = env or os.environ.copy()
         if input_file:
             with open(input_file, 'r') as f:
                 result = subprocess.run(
@@ -130,7 +131,8 @@ def run_mysql_command(cmd: list, input_file: str = None, timeout: int = 3600) ->
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
-                    timeout=timeout
+                    timeout=timeout,
+                    env=run_env
                 )
         else:
             result = subprocess.run(
@@ -139,7 +141,8 @@ def run_mysql_command(cmd: list, input_file: str = None, timeout: int = 3600) ->
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout
+                timeout=timeout,
+                env=run_env
             )
 
         if result.returncode == 0:
@@ -159,17 +162,18 @@ def run_mysql_command(cmd: list, input_file: str = None, timeout: int = 3600) ->
 def verify_table_exists(host: str, port: int, user: str, password: str, database: str, table: str) -> bool:
     """检查目标数据库中是否存在指定表"""
     mysql_path = find_mysql_tool('mysql')
+    mysql_env = {**os.environ, 'MYSQL_PWD': password}
     cmd = [
         mysql_path,
         f'--host={host}',
         f'--port={port}',
         f'--user={user}',
-        f'--password={password}',
         '--batch', '--skip-column-names',
         '-e', f"SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='{database}' AND TABLE_NAME='{table}'",
     ]
     try:
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, timeout=30, env=mysql_env)
         return result.stdout.strip() == '1'
     except Exception:
         return False
@@ -178,12 +182,12 @@ def verify_table_exists(host: str, port: int, user: str, password: str, database
 def get_table_count(host: str, port: int, user: str, password: str, database: str) -> dict:
     """获取数据库中所有表的行数统计"""
     mysql_path = find_mysql_tool('mysql')
+    mysql_env = {**os.environ, 'MYSQL_PWD': password}
     cmd = [
         mysql_path,
         f'--host={host}',
         f'--port={port}',
         f'--user={user}',
-        f'--password={password}',
         '--batch', '--skip-column-names',
         database,
         '-e', """
@@ -194,7 +198,8 @@ def get_table_count(host: str, port: int, user: str, password: str, database: st
     ]
     tables = {}
     try:
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60)
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, timeout=60, env=mysql_env)
         for line in result.stdout.strip().split('\n'):
             if line:
                 parts = line.split('\t')
@@ -226,7 +231,7 @@ class RecoveryManager:
         self.yes = yes
 
         self.mysql_path = find_mysql_tool('mysql')
-        self.pre_restore_tables: dict = {}  # 恢复前的表统计快照
+        self.pre_restore_tables: Optional[dict] = None  # None=未创建快照, {}=数据库为空
         self.restored_files: list = []  # 已恢复的文件列表（用于回滚）
         self.rollback_sql: list = []  # 回滚 SQL 列表
 
@@ -341,6 +346,7 @@ class RecoveryManager:
                 print("  目标数据库为空或无法连接（首次恢复？）")
         except Exception as e:
             print(f"  [WARNING] 快照创建失败: {e}")
+            self.pre_restore_tables = None
 
     def _restore_backup(self, backup_info: dict, is_full: bool = True) -> bool:
         """
@@ -359,19 +365,19 @@ class RecoveryManager:
             print(f"  [ERROR] 备份文件为空: {backup_path}")
             return False
 
-        # 构建 mysql 命令
+        # 构建 mysql 命令（密码通过环境变量传递，避免在进程列表中暴露）
         cmd = [
             self.mysql_path,
             f'--host={self.host}',
             f'--port={self.port}',
             f'--user={self.user}',
-            f'--password={self.password}',
             '--default-character-set=utf8mb4',
             self.database
         ]
 
         # 执行恢复
-        success, error_msg = run_mysql_command(cmd, input_file=backup_path, timeout=7200)
+        mysql_env = {**os.environ, 'MYSQL_PWD': self.password}
+        success, error_msg = run_mysql_command(cmd, input_file=backup_path, timeout=7200, env=mysql_env)
 
         if success:
             print(f"  ✓ 恢复成功: {os.path.basename(backup_path)} ({file_size} bytes)")
@@ -391,6 +397,17 @@ class RecoveryManager:
         if not post_restore_tables:
             print("  [WARNING] 无法获取恢复后的表信息")
             return False
+
+        # 如果未创建快照，无法对比，只检查恢复后是否有表
+        if self.pre_restore_tables is None:
+            if post_restore_tables:
+                print(f"  ✓ 恢复后数据库包含 {len(post_restore_tables)} 个表（快照不可用，跳过对比）")
+                for table, count in sorted(post_restore_tables.items()):
+                    print(f"    {table}: {count} 行")
+                return True
+            else:
+                print("  [WARNING] 恢复后数据库仍为空")
+                return False
 
         # 如果恢复前数据库为空，只检查恢复后是否有表
         if not self.pre_restore_tables:
@@ -433,28 +450,32 @@ class RecoveryManager:
         print("  执行回滚...")
         print("=" * 60)
 
-        if not self.pre_restore_tables:
+        if self.pre_restore_tables is None:
             print("  [WARNING] 无法回滚：缺少恢复前的快照数据")
             print("  建议手动检查数据库状态")
             return
 
         # 如果恢复前数据库为空，清空恢复后的数据
         if not self.pre_restore_tables:
-            print("  恢复前数据库为空，正在清空...")
+            print("  恢复前数据库为空，正在清空恢复后的数据...")
+            mysql_env = {**os.environ, 'MYSQL_PWD': self.password}
             post_tables = get_table_count(
                 self.host, self.port, self.user, self.password, self.database
             )
-            for table in post_tables:
+            for table in list(post_tables.keys()):
                 cmd = [
                     self.mysql_path,
                     f'--host={self.host}',
                     f'--port={self.port}',
                     f'--user={self.user}',
-                    f'--password={self.password}',
                     self.database,
                     '-e', f"DROP TABLE IF EXISTS `{table}`"
                 ]
-                run_mysql_command(cmd)
+                try:
+                    subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   text=True, timeout=30, env=mysql_env)
+                except Exception as e:
+                    print(f"  [WARNING] 删除表 {table} 失败: {e}")
             print("  回滚完成: 已清空数据库")
         else:
             print("  [WARNING] 自动回滚有限制，建议:")

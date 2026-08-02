@@ -65,11 +65,11 @@ class UserResponse(BaseModel):
         from_attributes = True
 
 
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-    """创建 JWT token"""
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None, token_version: int = 0):
+    """创建 JWT token，包含令牌版本号用于支持主动失效"""
     to_encode = data.copy()
     expire = datetime.utcnow() + (expires_delta or timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES))
-    to_encode.update({"exp": expire})
+    to_encode.update({"exp": expire, "ver": token_version})
     return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=ALGORITHM)
 
 
@@ -86,7 +86,7 @@ async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
     db: Session = Depends(get_db)
 ) -> User:
-    """获取当前认证用户"""
+    """获取当前认证用户，同时校验令牌版本号"""
     payload = verify_token(credentials.credentials)
     username = payload.get("sub")
     if not username:
@@ -95,6 +95,12 @@ async def get_current_user(
     user = db.query(User).filter(User.username == username).first()
     if not user or not user.is_active:
         raise HTTPException(status_code=401, detail="用户不存在或已禁用")
+    
+    # 校验令牌版本号（用户名/密码变更后旧令牌自动失效）
+    token_ver = payload.get("ver", 0)
+    if token_ver != (user.token_version or 0):
+        raise HTTPException(status_code=401, detail="令牌已失效，请重新登录")
+    
     return user
 
 
@@ -151,8 +157,8 @@ async def login(request: Request, login_data: LoginRequest, db: Session = Depend
         db.commit()
         raise HTTPException(status_code=403, detail="账户已禁用")
     
-    # 创建 token
-    access_token = create_access_token(data={"sub": user.username})
+    # 创建 token（包含令牌版本号）
+    access_token = create_access_token(data={"sub": user.username}, token_version=user.token_version or 0)
     
     # 更新最后登录时间
     user.last_login = now_beijing()
@@ -252,13 +258,14 @@ async def change_username(
     
     old_username = current_user.username
     current_user.username = data.new_username
+    current_user.token_version = (current_user.token_version or 0) + 1
     db.commit()
     
     log_operation(db, current_user, "修改用户名", "user", current_user.id, 
                   f"{old_username} -> {data.new_username}")
     
-    # 生成新token
-    access_token = create_access_token(data={"sub": data.new_username})
+    # 生成新token（使用新的令牌版本号）
+    access_token = create_access_token(data={"sub": data.new_username}, token_version=current_user.token_version)
     
     return {"message": "用户名修改成功", "access_token": access_token, "username": data.new_username}
 
@@ -279,8 +286,12 @@ async def change_password(
         raise HTTPException(status_code=400, detail="新密码至少6个字符")
     
     current_user.password_hash = pwd_context.hash(data.new_password)
+    current_user.token_version = (current_user.token_version or 0) + 1
     db.commit()
     
     log_operation(db, current_user, "修改密码", "user", current_user.id, current_user.username)
     
-    return {"message": "密码修改成功"}
+    # 生成新token（旧令牌因版本号不匹配将自动失效）
+    access_token = create_access_token(data={"sub": current_user.username}, token_version=current_user.token_version)
+    
+    return {"message": "密码修改成功", "access_token": access_token}

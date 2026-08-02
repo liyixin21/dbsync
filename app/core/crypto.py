@@ -31,7 +31,11 @@ def decrypt(ciphertext: str) -> str:
     try:
         return _fernet.decrypt(ciphertext.encode()).decode()
     except Exception:
-        # 如果解密失败，可能是旧的明文密码，直接返回
+        # 如果解密失败，可能是旧的明文密码或密钥已变更
+        # 注意：如果 SECRET_KEY 已变更，所有已加密的密码都将无法解密，
+        # 需要重新录入数据库密码
+        from loguru import logger
+        logger.warning("数据库密码解密失败，可能为明文存储或密钥已变更，将以原文尝试连接")
         return ciphertext
 
 

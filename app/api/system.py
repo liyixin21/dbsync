@@ -9,7 +9,8 @@ from datetime import datetime
 
 from ..core.database import get_db
 from ..core.config import settings
-from ..models.database import SystemConfig
+from ..models.database import SystemConfig, User
+from .auth import get_current_user
 
 router = APIRouter()
 
@@ -39,7 +40,7 @@ class SystemStatus(BaseModel):
 
 
 @router.get("/status", response_model=SystemStatus)
-async def get_system_status(db: Session = Depends(get_db)):
+async def get_system_status(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """获取系统状态"""
     import psutil
     import os
@@ -88,14 +89,14 @@ async def get_system_status(db: Session = Depends(get_db)):
 
 
 @router.get("/configs", response_model=List[SystemConfigResponse])
-async def list_system_configs(db: Session = Depends(get_db)):
+async def list_system_configs(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """获取系统配置列表"""
     configs = db.query(SystemConfig).all()
     return configs
 
 
 @router.get("/configs/{key}", response_model=SystemConfigResponse)
-async def get_system_config(key: str, db: Session = Depends(get_db)):
+async def get_system_config(key: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """获取单个系统配置"""
     config = db.query(SystemConfig).filter(SystemConfig.key == key).first()
     if not config:
@@ -107,7 +108,8 @@ async def get_system_config(key: str, db: Session = Depends(get_db)):
 async def update_system_config(
     key: str,
     config: SystemConfigUpdate,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     """更新系统配置"""
     db_config = db.query(SystemConfig).filter(SystemConfig.key == key).first()
@@ -131,7 +133,7 @@ async def update_system_config(
 
 
 @router.get("/theme")
-async def get_theme_config(db: Session = Depends(get_db)):
+async def get_theme_config(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """获取主题配置"""
     # 默认主题配置
     default_theme = {
@@ -161,7 +163,7 @@ async def get_theme_config(db: Session = Depends(get_db)):
 
 
 @router.put("/theme")
-async def update_theme_config(theme: Dict[str, Any], db: Session = Depends(get_db)):
+async def update_theme_config(theme: Dict[str, Any], db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """更新主题配置"""
     # 更新各个配置项
     for key, value in theme.items():
@@ -185,7 +187,8 @@ async def update_theme_config(theme: Dict[str, Any], db: Session = Depends(get_d
 @router.get("/logs")
 async def get_system_logs(
     lines: int = 100,
-    level: Optional[str] = None
+    level: Optional[str] = None,
+    current_user: User = Depends(get_current_user)
 ):
     """获取系统日志"""
     import os

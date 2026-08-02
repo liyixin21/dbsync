@@ -66,7 +66,8 @@ async def list_sync_tasks(
     skip: int = 0,
     limit: int = 100,
     status: Optional[str] = None,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     """获取同步任务列表"""
     query = db.query(SyncTask)
@@ -77,7 +78,7 @@ async def list_sync_tasks(
 
 
 @router.get("/{task_id}", response_model=SyncTaskResponse)
-async def get_sync_task(task_id: int, db: Session = Depends(get_db)):
+async def get_sync_task(task_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """获取单个同步任务信息"""
     task = db.query(SyncTask).filter(SyncTask.id == task_id).first()
     if not task:
@@ -127,7 +128,8 @@ async def create_sync_task(
 async def update_sync_task(
     task_id: int,
     task: SyncTaskUpdate,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     """更新同步任务"""
     db_task = db.query(SyncTask).filter(SyncTask.id == task_id).first()
@@ -279,13 +281,17 @@ async def full_copy_database(
         source_password = decrypt(source_db.password)
         target_password = decrypt(target_db.password)
         
+        # 通过环境变量传密码，避免在进程列表中暴露
+        import os as _os
+        dump_env = {**_os.environ, 'MYSQL_PWD': source_password}
+        import_env = {**_os.environ, 'MYSQL_PWD': target_password}
+        
         # Step 1: mysqldump 导出源数据库（使用更完整的参数确保数据完整性）
         dump_cmd = [
             mysqldump_path,
             f'--host={source_db.host}',
             f'--port={source_db.port}',
             f'--user={source_db.username}',
-            f'--password={source_password}',
             '--single-transaction',
             '--routines',
             '--triggers',
@@ -294,7 +300,7 @@ async def full_copy_database(
             '--default-character-set=utf8mb4',  # 指定字符集
             '--complete-insert',                # 生成完整 INSERT 语句（包含列名）
             '--skip-lock-tables',               # 不锁定表
-            '--skip-ssl',                       # 跳过 SSL（避免自签名证书问题）
+            '--ssl-mode=DISABLED',              # 跳过 SSL（兼容新旧 MySQL 客户端）
             source_db.database_name
         ]
         
@@ -304,10 +310,9 @@ async def full_copy_database(
             f'--host={target_db.host}',
             f'--port={target_db.port}',
             f'--user={target_db.username}',
-            f'--password={target_password}',
             '--default-character-set=utf8mb4',  # 指定字符集
             '--force',                          # 遇到错误继续执行
-            '--skip-ssl',                       # 跳过 SSL（避免自签名证书问题）
+            '--ssl-mode=DISABLED',              # 跳过 SSL（兼容新旧 MySQL 客户端）
             '--init-command=SET FOREIGN_KEY_CHECKS=0, UNIQUE_CHECKS=0',  # 禁用检查提高导入速度和可靠性
             target_db.database_name
         ]
@@ -325,7 +330,7 @@ async def full_copy_database(
             # Step 1: mysqldump 导出直接写入临时文件（避免内存溢出和二进制数据损坏）
             with open(tmp_path, 'wb') as f:
                 dump_result = subprocess.run(
-                    dump_cmd, stdout=f, stderr=subprocess.PIPE, timeout=3600
+                    dump_cmd, stdout=f, stderr=subprocess.PIPE, timeout=3600, env=dump_env
                 )
             
             if dump_result.returncode != 0:
@@ -339,7 +344,7 @@ async def full_copy_database(
             # 先禁用外键检查，导入完成后恢复（解决表顺序依赖问题）
             with open(tmp_path, 'rb') as f:
                 import_result = subprocess.run(
-                    import_cmd, stdin=f, stderr=subprocess.PIPE, timeout=3600
+                    import_cmd, stdin=f, stderr=subprocess.PIPE, timeout=3600, env=import_env
                 )
             
             if import_result.returncode != 0:
@@ -390,7 +395,7 @@ async def full_copy_database(
 
 
 @router.get("/{task_id}/status", response_model=SyncTaskStatus)
-async def get_sync_task_status(task_id: int, db: Session = Depends(get_db)):
+async def get_sync_task_status(task_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     """获取同步任务状态"""
     task = db.query(SyncTask).filter(SyncTask.id == task_id).first()
     if not task:
