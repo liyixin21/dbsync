@@ -322,6 +322,7 @@ async def restore_backup(
             f'--host={target_db.host}',
             f'--port={target_db.port}',
             f'--user={target_db.username}',
+            '--init-command=SET FOREIGN_KEY_CHECKS=0, UNIQUE_CHECKS=0',
             target_db.database_name
         ]
 

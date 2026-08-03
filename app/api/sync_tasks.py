@@ -296,11 +296,10 @@ async def full_copy_database(
             '--routines',
             '--triggers',
             '--events',
-            '--hex-blob',                       # 以十六进制格式处理 BLOB/BINARY 列
-            '--default-character-set=utf8mb4',  # 指定字符集
-            '--complete-insert',                # 生成完整 INSERT 语句（包含列名）
-            '--skip-lock-tables',               # 不锁定表
-            '--ssl=0',                           # 禁用 SSL（兼容新旧版本）
+            '--hex-blob',
+            '--default-character-set=utf8mb4',
+            '--complete-insert',
+            '--skip-lock-tables',
             source_db.database_name
         ]
         
@@ -310,10 +309,9 @@ async def full_copy_database(
             f'--host={target_db.host}',
             f'--port={target_db.port}',
             f'--user={target_db.username}',
-            '--default-character-set=utf8mb4',  # 指定字符集
-            '--force',                          # 遇到错误继续执行
-            '--ssl=0',                           # 禁用 SSL（兼容新旧版本）
-            '--init-command=SET FOREIGN_KEY_CHECKS=0, UNIQUE_CHECKS=0',  # 禁用检查提高导入速度和可靠性
+            '--default-character-set=utf8mb4',
+            '--force',
+            '--init-command=SET FOREIGN_KEY_CHECKS=0, UNIQUE_CHECKS=0',
             target_db.database_name
         ]
         

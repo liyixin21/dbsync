@@ -110,17 +110,15 @@ class MySQLBinlogSync:
             raise Exception(f"目标数据库连接失败: {e}")
 
     def _close_connections(self):
-        """关闭数据库连接"""
-        try:
-            if self.target_conn and self.target_conn.is_connected():
-                self.target_conn.close()
-        except Exception:
-            pass
-        try:
-            if self._source_conn and self._source_conn.is_connected():
-                self._source_conn.close()
-        except Exception:
-            pass
+        """关闭数据库连接（不调用 is_connected 避免卡死）"""
+        for conn in [self.target_conn, self._source_conn]:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        self.target_conn = None
+        self._source_conn = None
 
     def _get_column_names(self, database: str, table: str) -> List[str]:
         """从源数据库获取表的列名（带缓存）"""
@@ -129,7 +127,7 @@ class MySQLBinlogSync:
             return self._column_cache[cache_key]
 
         try:
-            if not self._source_conn or not self._source_conn.is_connected():
+            if not self._source_conn:
                 self._source_conn = mysql.connector.connect(**self.source_config)
             cursor = self._source_conn.cursor()
             cursor.execute(
@@ -433,7 +431,7 @@ class MySQLBinlogSync:
         db_table = (m.group(1), m.group(2)) if m else None
 
         try:
-            if not self.target_conn or not self.target_conn.is_connected():
+            if not self.target_conn:
                 self._connect_target()
             cursor = self.target_conn.cursor()
             cursor.execute(sql, params)
@@ -599,7 +597,8 @@ class SyncService:
                 'user': source_db.username,
                 'password': decrypt(source_db.password),
                 'database': source_db.database_name,
-                'ssl_disabled': True  # 禁用 SSL（避免自签名证书问题）
+                'ssl_disabled': True,
+                'connection_timeout': 10
             }
 
             target_config = {
@@ -608,7 +607,8 @@ class SyncService:
                 'user': target_db.username,
                 'password': decrypt(target_db.password),
                 'database': target_db.database_name,
-                'ssl_disabled': True  # 禁用 SSL（避免自签名证书问题）
+                'ssl_disabled': True,
+                'connection_timeout': 10
             }
             
             # 如果有保存的 binlog 位置，从中断点恢复（避免同步间隙）

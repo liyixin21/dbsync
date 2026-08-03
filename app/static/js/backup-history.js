@@ -42,7 +42,22 @@ function renderPagination(total, currentPage) {
   container.innerHTML = html;
 }
 
-window.downloadBackup = function(id) { window.open(`/api/backup-history/${id}/download`, '_blank'); };
+window.downloadBackup = async function(id) {
+  try {
+    const token = localStorage.getItem('dbsync_token');
+    const res = await fetch(`/api/backup-history/${id}/download`, {
+      headers: token ? { 'Authorization': `Bearer ${token}` } : {}
+    });
+    if (!res.ok) throw new Error('下载失败');
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `backup_${id}.sql`;
+    a.click();
+    URL.revokeObjectURL(url);
+  } catch (e) { showToast('下载失败', 'error'); }
+};
 
 window.restoreBackup = async function(id) {
   showConfirm('恢复数据库', '确定要从此备份恢复数据库吗？此操作不可撤销。', async () => {

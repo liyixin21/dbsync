@@ -63,7 +63,8 @@ class MySQLBackup:
                 user=self.database_config['username'],
                 password=self.database_config['password'],
                 database=self.database_config['database'],
-                ssl_disabled=True  # 禁用 SSL（避免自签名证书问题）
+                ssl_disabled=True,
+                connection_timeout=10
             )
             conn.close()
         except Exception as e:
@@ -201,7 +202,6 @@ class MySQLBackup:
                 '--routines',
                 '--triggers',
                 '--events',
-                '--ssl=0',                       # 禁用 SSL（兼容新旧版本）
                 self.database_config['database']
             ]
             
@@ -271,7 +271,6 @@ class MySQLBackup:
                     f'--port={self.database_config["port"]}',
                     f'--user={self.database_config["username"]}',
                     '--read-from-remote-server',
-                    '--ssl=0',
                     f'--start-datetime={start_time.strftime("%Y-%m-%d %H:%M:%S")}',
                     f'--stop-datetime={stop_time.strftime("%Y-%m-%d %H:%M:%S")}',
                     binlog_file
@@ -316,7 +315,8 @@ class MySQLBackup:
                 port=self.database_config['port'],
                 user=self.database_config['username'],
                 password=self.database_config['password'],
-                database=self.database_config['database']
+                database=self.database_config['database'],
+                connection_timeout=10
             )
             cursor = conn.cursor()
             cursor.execute("SHOW BINARY LOGS")
@@ -342,7 +342,8 @@ class MySQLBackup:
                 port=self.database_config['port'],
                 user=self.database_config['username'],
                 password=self.database_config['password'],
-                database=self.database_config['database']
+                database=self.database_config['database'],
+                connection_timeout=10
             )
             cursor = conn.cursor()
             
