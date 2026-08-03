@@ -144,14 +144,18 @@ function renderTokens(lightMap, darkMap) {
   }).join('');
 }
 
-function updateTheme() {
+let _lastSaved={hex:'',dark:null};
+function updateTheme(save=false) {
   const hex = document.getElementById('colorPicker').value;
   const contrast = document.getElementById('contrastSelect').value;
   document.getElementById('sourceHex').textContent = hex.toUpperCase();
   const { light, dark } = generateScheme(hex, 'TonalSpot', contrast);
   applyTheme(schemeToMap(light), schemeToMap(dark));
-  // Save theme
-  api('/system/theme', { method: 'PUT', body: JSON.stringify({ primary_color: hex, dark_mode: isDark }) }).catch(() => {});
+  // 仅主题变化时才保存
+  if (save && (hex !== _lastSaved.hex || isDark !== _lastSaved.dark)) {
+    _lastSaved = { hex, dark: isDark };
+    api('/system/theme', { method: 'PUT', body: JSON.stringify({ primary_color: hex, dark_mode: isDark }) }).catch(() => {});
+  }
 }
 
 // ============================================================
@@ -163,7 +167,7 @@ function toggleTheme() {
   isDark = !isDark;
   document.documentElement.setAttribute('data-theme', isDark ? 'dark' : 'light');
   themeToggle.querySelector('span').textContent = isDark ? 'light_mode' : 'dark_mode';
-  updateTheme();
+  updateTheme(true);
 }
 
 themeToggle.addEventListener('click', toggleTheme);
@@ -171,8 +175,8 @@ themeToggle.addEventListener('click', toggleTheme);
 // ============================================================
 // Event listeners
 // ============================================================
-document.getElementById('colorPicker').addEventListener('input', updateTheme);
-document.getElementById('contrastSelect').addEventListener('change', updateTheme);
+document.getElementById('colorPicker').addEventListener('input', () => updateTheme(true));
+document.getElementById('contrastSelect').addEventListener('change', () => updateTheme(true));
 
 // ============================================================
 // Navigation
@@ -469,7 +473,7 @@ async function loadBackupPlans() {
       <td><strong>${esc(p.name)}</strong></td>
       <td>${esc(dbMap[p.database_id] || '?')}</td>
       <td>${p.backup_type === 'full' ? '全量' : '增量'}</td>
-      <td>${p.schedule_interval ? `每 ${p.schedule_interval} 分钟` : p.schedule_cron || '-'}</td>
+      <td>${p.schedule_interval ? `每 ${p.schedule_interval} 分钟` : '-'}</td>
       <td><span class="status-badge ${p.is_active ? 'status-running' : 'status-stopped'}">${p.is_active ? '启用' : '禁用'}</span></td>
       <td class="actions-row">
         <md-icon-button onclick="executeBackupPlan(${p.id})"><span class="material-symbols-outlined">play_arrow</span></md-icon-button>
@@ -504,9 +508,7 @@ function openBackupPlanDialog() {
   dbSelect.value = String(allDatabases[0].id);
   document.getElementById('planName').value = '';
   document.getElementById('planInterval').value = '60';
-  document.getElementById('planCron').value = '';
-  document.getElementById('planPath').value = '';
-  document.getElementById('planRetention').value = '30';
+  document.getElementById('planRetention').value = '50';
   openDialog(backupPlanDialog);
 }
 window.openBackupPlanDialog = openBackupPlanDialog;
@@ -517,12 +519,10 @@ document.getElementById('saveBackupPlanBtn').addEventListener('click', async () 
     database_id: parseInt(document.getElementById('planDatabase').value),
     backup_type: document.getElementById('planType').value,
     schedule_interval: parseInt(document.getElementById('planInterval').value) || null,
-    schedule_cron: document.getElementById('planCron').value || null,
-    backup_path: document.getElementById('planPath').value || null,
-    retention_days: parseInt(document.getElementById('planRetention').value) || 30
+    retention_count: parseInt(document.getElementById('planRetention').value) || 50
   };
   if (!data.name) { showToast('请输入计划名称', 'error'); return; }
-  if (!data.schedule_interval && !data.schedule_cron) { showToast('请设置备份间隔或Cron表达式', 'error'); return; }
+  if (!data.schedule_interval) { showToast('请设置备份间隔（分钟）', 'error'); return; }
   try {
     await api('/backup-plans/', { method: 'POST', body: JSON.stringify(data) });
     showToast('备份计划创建成功', 'success');

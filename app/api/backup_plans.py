@@ -20,10 +20,8 @@ class BackupPlanCreate(BaseModel):
     name: str
     database_id: int
     backup_type: str = "full"
-    schedule_cron: Optional[str] = None
     schedule_interval: Optional[int] = None
-    backup_path: Optional[str] = None
-    retention_days: int = 30
+    retention_count: int = 50
     is_active: bool = True
 
 
@@ -32,10 +30,8 @@ class BackupPlanUpdate(BaseModel):
     name: Optional[str] = None
     database_id: Optional[int] = None
     backup_type: Optional[str] = None
-    schedule_cron: Optional[str] = None
     schedule_interval: Optional[int] = None
-    backup_path: Optional[str] = None
-    retention_days: Optional[int] = None
+    retention_count: Optional[int] = None
     is_active: Optional[bool] = None
 
 
@@ -45,10 +41,8 @@ class BackupPlanResponse(BaseModel):
     name: str
     database_id: int
     backup_type: str = "full"
-    schedule_cron: Optional[str] = None
     schedule_interval: Optional[int] = None
-    backup_path: Optional[str] = None
-    retention_days: Optional[int] = 30
+    retention_count: Optional[int] = 50
     is_active: bool = True
     created_at: datetime
     updated_at: datetime
@@ -100,17 +94,15 @@ async def create_backup_plan(
         raise HTTPException(status_code=400, detail="备份类型必须是 full 或 incremental")
     
     # 验证调度配置
-    if not plan.schedule_cron and not plan.schedule_interval:
-        raise HTTPException(status_code=400, detail="必须配置 schedule_cron 或 schedule_interval")
+    if not plan.schedule_interval:
+        raise HTTPException(status_code=400, detail="必须配置备份间隔（分钟）")
     
     db_plan = BackupPlan(
         name=plan.name,
         database_id=plan.database_id,
         backup_type=BackupType(plan.backup_type),
-        schedule_cron=plan.schedule_cron,
         schedule_interval=plan.schedule_interval,
-        backup_path=plan.backup_path,
-        retention_days=plan.retention_days,
+        retention_count=plan.retention_count,
         is_active=plan.is_active
     )
     db.add(db_plan)
@@ -158,17 +150,11 @@ async def update_backup_plan(
             raise HTTPException(status_code=400, detail="备份类型必须是 full 或 incremental")
         db_plan.backup_type = BackupType(plan.backup_type)
     
-    if plan.schedule_cron is not None:
-        db_plan.schedule_cron = plan.schedule_cron
-    
     if plan.schedule_interval is not None:
         db_plan.schedule_interval = plan.schedule_interval
     
-    if plan.backup_path is not None:
-        db_plan.backup_path = plan.backup_path
-    
-    if plan.retention_days is not None:
-        db_plan.retention_days = plan.retention_days
+    if plan.retention_count is not None:
+        db_plan.retention_count = plan.retention_count
     
     if plan.is_active is not None:
         db_plan.is_active = plan.is_active

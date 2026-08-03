@@ -300,7 +300,7 @@ async def full_copy_database(
             '--default-character-set=utf8mb4',  # 指定字符集
             '--complete-insert',                # 生成完整 INSERT 语句（包含列名）
             '--skip-lock-tables',               # 不锁定表
-            '--ssl-mode=DISABLED',              # 跳过 SSL（兼容新旧 MySQL 客户端）
+            '--ssl=0',                           # 禁用 SSL（兼容新旧版本）
             source_db.database_name
         ]
         
@@ -312,7 +312,7 @@ async def full_copy_database(
             f'--user={target_db.username}',
             '--default-character-set=utf8mb4',  # 指定字符集
             '--force',                          # 遇到错误继续执行
-            '--ssl-mode=DISABLED',              # 跳过 SSL（兼容新旧 MySQL 客户端）
+            '--ssl=0',                           # 禁用 SSL（兼容新旧版本）
             '--init-command=SET FOREIGN_KEY_CHECKS=0, UNIQUE_CHECKS=0',  # 禁用检查提高导入速度和可靠性
             target_db.database_name
         ]

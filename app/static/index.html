@@ -434,13 +434,11 @@
           <md-select-option value="incremental"><div slot="headline">增量备份</div></md-select-option>
         </md-filled-select>
       </div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
-        <md-outlined-text-field label="备份间隔 (分钟)" type="number" id="planInterval" placeholder="例如: 60"></md-outlined-text-field>
-        <md-outlined-text-field label="Cron 表达式" id="planCron" placeholder="例如: 0 2 * * *"></md-outlined-text-field>
+      <div style="margin-bottom:12px">
+        <md-outlined-text-field label="备份间隔 (分钟)" type="number" id="planInterval" placeholder="例如: 60" style="width:100%"></md-outlined-text-field>
       </div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
-        <md-outlined-text-field label="备份路径" id="planPath" placeholder="留空使用默认路径"></md-outlined-text-field>
-        <md-outlined-text-field label="保留天数" type="number" id="planRetention" value="30"></md-outlined-text-field>
+      <div style="margin-bottom:12px">
+        <md-outlined-text-field label="保留数量" type="number" id="planRetention" value="50" style="width:100%"></md-outlined-text-field>
       </div>
     </form>
   </div>
@@ -1104,7 +1102,7 @@ async function loadBackupPlans() {
       <td><strong>${esc(p.name)}</strong></td>
       <td>${esc(dbMap[p.database_id] || '?')}</td>
       <td>${p.backup_type === 'full' ? '全量' : '增量'}</td>
-      <td>${p.schedule_interval ? `每 ${p.schedule_interval} 分钟` : p.schedule_cron || '-'}</td>
+      <td>${p.schedule_interval ? `每 ${p.schedule_interval} 分钟` : '-'}</td>
       <td><md-switch ${p.is_active ? 'selected' : ''} onchange="toggleBackupPlanActive(${p.id}, this.selected)"></md-switch></td>
       <td class="actions-row">
         <md-fab size="small" variant="secondary" onclick="executeBackupPlan(${p.id})"><span class="material-symbols-outlined" slot="icon">play_arrow</span></md-fab>
@@ -1125,9 +1123,7 @@ function openBackupPlanDialog() {
   document.getElementById('planId').value = '';
   document.getElementById('planName').value = '';
   document.getElementById('planInterval').value = '60';
-  document.getElementById('planCron').value = '';
-  document.getElementById('planPath').value = '';
-  document.getElementById('planRetention').value = '30';
+  document.getElementById('planRetention').value = '50';
   document.getElementById('backupPlanDialogTitle').textContent = '创建备份计划';
   openDialog(backupPlanDialog);
 }
@@ -1140,12 +1136,10 @@ document.getElementById('saveBackupPlanBtn').addEventListener('click', async () 
     database_id: parseInt(document.getElementById('planDatabase').value),
     backup_type: document.getElementById('planType').value,
     schedule_interval: parseInt(document.getElementById('planInterval').value) || null,
-    schedule_cron: document.getElementById('planCron').value || null,
-    backup_path: document.getElementById('planPath').value || null,
-    retention_days: parseInt(document.getElementById('planRetention').value) || 30
+    retention_count: parseInt(document.getElementById('planRetention').value) || 50
   };
   if (!data.name) { showToast('请输入计划名称', 'error'); return; }
-  if (!data.schedule_interval && !data.schedule_cron) { showToast('请设置备份间隔或Cron表达式', 'error'); return; }
+  if (!data.schedule_interval) { showToast('请设置备份间隔（分钟）', 'error'); return; }
   try {
     if (id) {
       await api(`/backup-plans/${id}`, { method: 'PUT', body: JSON.stringify(data) });
@@ -1245,9 +1239,7 @@ window.editBackupPlan = async function(id) {
   dbSelect.value = String(plan.database_id);
   document.getElementById('planType').value = plan.backup_type;
   document.getElementById('planInterval').value = plan.schedule_interval || '';
-  document.getElementById('planCron').value = plan.schedule_cron || '';
-  document.getElementById('planPath').value = plan.backup_path || '';
-  document.getElementById('planRetention').value = plan.retention_days || 30;
+  document.getElementById('planRetention').value = plan.retention_count || 50;
   document.getElementById('backupPlanDialogTitle').textContent = '编辑备份计划';
   openDialog(backupPlanDialog);
 };

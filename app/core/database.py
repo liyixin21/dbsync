@@ -70,7 +70,15 @@ def run_migrations():
 
     # 迁移 2：backup_history.file_size 的类型升级
     # SQLite 不支持直接修改列类型，但新列已经是 BIGINT，无需额外处理
-    # 如有需要，后续可在此处添加更多迁移
+
+    # 迁移 3：为 backup_plans 表添加 retention_count 列（替代旧的 retention_days）
+    if 'backup_plans' in inspector.get_table_names():
+        cols = [c['name'] for c in inspector.get_columns('backup_plans')]
+        if 'retention_count' not in cols:
+            with engine.connect() as conn:
+                conn.execute(text("ALTER TABLE backup_plans ADD COLUMN retention_count INTEGER DEFAULT 50"))
+                conn.commit()
+            print("[Migration] 已添加 backup_plans.retention_count 列")
 
 
 def init_db():

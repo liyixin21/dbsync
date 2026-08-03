@@ -11,7 +11,6 @@ from loguru import logger
 import schedule
 import time
 import glob
-from croniter import croniter
 
 from ..core.database import SessionLocal
 from ..core.config import settings, now_beijing
@@ -96,44 +95,9 @@ class MySQLBackup:
     def _setup_schedule(self):
         """设置定时任务"""
         interval = self.backup_config.get('schedule_interval')
-        cron = self.backup_config.get('schedule_cron')
-
         if interval:
-            # 使用间隔调度
             self.scheduler.every(interval).minutes.do(self._execute_backup)
-        elif cron:
-            # 使用 croniter 解析 cron 表达式，计算下次运行时间
-            if croniter.is_valid(cron):
-                now = datetime.now()
-                cron_itr = croniter(cron, now)
-                next_run = cron_itr.get_next(datetime)
-                delay_seconds = (next_run - now).total_seconds()
-                # 使用 schedule 在计算出的时间点运行
-                self.scheduler.every(delay_seconds).seconds.do(self._execute_and_reschedule)
-                self._cron_expr = cron
-                self._last_scheduled_run = now  # 记录调度基准时间
-                logger.info(f"备份计划 {self.plan_id} cron='{cron}' 下次运行: {next_run}")
-            else:
-                logger.error(f"备份计划 {self.plan_id} cron 表达式无效: {cron}")
-
-    def _execute_and_reschedule(self):
-        """执行备份后重新调度下一次（用于 cron 模式，避免时间漂移）"""
-        self._execute_backup()
-        # 基于上次调度时间计算下一次运行，避免因备份耗时而漂移
-        if hasattr(self, '_cron_expr'):
-            # 使用上次调度时间计算下次运行，而非当前时间
-            base_time = self._last_scheduled_run if hasattr(self, '_last_scheduled_run') else datetime.now()
-            cron_itr = croniter(self._cron_expr, base_time)
-            next_run = cron_itr.get_next(datetime)
-            # 如果计算出的下次时间已过（可能性很小），用当前时间重算
-            if next_run <= datetime.now():
-                cron_itr = croniter(self._cron_expr, datetime.now())
-                next_run = cron_itr.get_next(datetime)
-            delay_seconds = max(1, (next_run - datetime.now()).total_seconds())
-            self._last_scheduled_run = next_run
-            self.scheduler.clear()
-            self.scheduler.every(delay_seconds).seconds.do(self._execute_and_reschedule)
-            logger.info(f"备份计划 {self.plan_id} 下次运行: {next_run}")
+            logger.info(f"备份计划 {self.plan_id} 每 {interval} 分钟执行一次")
     
     def _schedule_loop(self):
         """调度循环"""
@@ -237,7 +201,7 @@ class MySQLBackup:
                 '--routines',
                 '--triggers',
                 '--events',
-                '--ssl-mode=DISABLED',          # 跳过 SSL（兼容新旧 MySQL 客户端）
+                '--ssl=0',                       # 禁用 SSL（兼容新旧版本）
                 self.database_config['database']
             ]
             
@@ -307,7 +271,7 @@ class MySQLBackup:
                     f'--port={self.database_config["port"]}',
                     f'--user={self.database_config["username"]}',
                     '--read-from-remote-server',
-                    '--ssl-mode=DISABLED',
+                    '--ssl=0',
                     f'--start-datetime={start_time.strftime("%Y-%m-%d %H:%M:%S")}',
                     f'--stop-datetime={stop_time.strftime("%Y-%m-%d %H:%M:%S")}',
                     binlog_file
@@ -421,34 +385,35 @@ class MySQLBackup:
         return now_beijing() - timedelta(hours=1)
 
     def _cleanup_old_backups(self):
-        """清理超出保留天数的过期备份文件和记录"""
-        retention_days = self.backup_config.get('retention_days', 30)
-        if not retention_days or retention_days <= 0:
+        """只保留最近 N 个成功备份，删除更早的"""
+        retention_count = self.backup_config.get('retention_count', 50)
+        if not retention_count or retention_count <= 0:
             return
 
-        cutoff = now_beijing() - timedelta(days=retention_days)
         db = SessionLocal()
         try:
-            old_records = db.query(BackupHistory).filter(
+            # 按时间倒序查所有成功的备份
+            all_records = db.query(BackupHistory).filter(
                 BackupHistory.backup_plan_id == self.plan_id,
-                BackupHistory.status == BackupStatus.COMPLETED,
-                BackupHistory.end_time < cutoff
-            ).all()
+                BackupHistory.status == BackupStatus.COMPLETED
+            ).order_by(BackupHistory.end_time.desc()).all()
 
-            for record in old_records:
-                # 删除备份文件
+            if len(all_records) <= retention_count:
+                db.close()
+                return
+
+            # 删除超出保留数量的旧备份
+            to_delete = all_records[retention_count:]
+            for record in to_delete:
                 if record.file_path and os.path.exists(record.file_path):
                     try:
                         os.remove(record.file_path)
-                        logger.info(f"已删除过期备份文件: {record.file_path}")
                     except OSError as e:
                         logger.warning(f"删除备份文件失败: {record.file_path} - {e}")
-                # 删除数据库记录
                 db.delete(record)
 
-            if old_records:
-                db.commit()
-                logger.info(f"备份计划 {self.plan_id} 已清理 {len(old_records)} 条过期记录")
+            db.commit()
+            logger.info(f"备份计划 {self.plan_id} 已清理 {len(to_delete)} 条旧备份（保留 {retention_count}）")
         except Exception as e:
             logger.error(f"清理过期备份失败: {e}")
         finally:
@@ -555,13 +520,12 @@ class BackupService:
             
             backup_config = {
                 'backup_type': plan.backup_type,
-                'schedule_cron': plan.schedule_cron,
                 'schedule_interval': plan.schedule_interval,
-                'backup_dir': plan.backup_path or settings.BACKUP_DIR,
-                'retention_days': plan.retention_days
+                'backup_dir': settings.BACKUP_DIR,
+                'retention_count': plan.retention_count
             }
             
-            logger.info(f"备份计划 {plan_id} 配置: type={plan.backup_type}, interval={plan.schedule_interval}, cron={plan.schedule_cron}, dir={backup_config['backup_dir']}")
+            logger.info(f"备份计划 {plan_id} 配置: type={plan.backup_type}, interval={plan.schedule_interval}")
             
             backup = MySQLBackup(plan_id, database_config, backup_config)
             self.backup_plans[plan_id] = backup
@@ -625,8 +589,8 @@ class BackupService:
             }
             backup_config = {
                 'backup_type': plan.backup_type,
-                'backup_dir': plan.backup_path or settings.BACKUP_DIR,
-                'retention_days': plan.retention_days
+                'backup_dir': settings.BACKUP_DIR,
+                'retention_count': plan.retention_count
             }
             db.close()
 
