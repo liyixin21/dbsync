@@ -20,7 +20,7 @@ class Settings(BaseSettings):
     
     # 应用配置
     APP_NAME: str = "数据库同步备份工具"
-    APP_VERSION: str = "1.0.0"
+    APP_VERSION: str = "1.5.0"
     DEBUG: bool = True
     
     # 服务器配置
