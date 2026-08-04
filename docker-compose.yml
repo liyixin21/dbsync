@@ -12,7 +12,7 @@ services:
       - HOST=0.0.0.0
       - PORT=8000
       - DEBUG=false
-      - SECRET_KEY=change-this-to-a-random-secret-key
+      - SECRET_KEY=change-this-to-a-random-secret-key # 生成方式: python -c "import secrets; print(secrets.token_urlsafe(32))"
       - TZ=Asia/Shanghai  # 设置时区为北京时间
     restart: unless-stopped
     networks:
