@@ -11,6 +11,7 @@ from ..core.database import get_db
 from ..core.services import backup_service
 from ..models.database import BackupPlan, BackupType, Database, User
 from .auth import get_current_user, log_operation
+from loguru import logger
 
 router = APIRouter()
 
@@ -110,6 +111,13 @@ async def create_backup_plan(
     db.refresh(db_plan)
     
     log_operation(db, current_user, "创建备份计划", "backup_plan", db_plan.id, db_plan.name)
+    
+    # 如果是启用的，立即启动调度
+    if db_plan.is_active:
+        try:
+            await backup_service.start_plan(db_plan.id)
+        except Exception as e:
+            logger.warning(f"创建备份计划后启动失败: {e}")
     
     return db_plan
 
