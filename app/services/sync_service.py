@@ -127,17 +127,26 @@ class MySQLBinlogSync:
             return self._column_cache[cache_key]
 
         try:
-            if not self._source_conn:
-                self._source_conn = mysql.connector.connect(**self.source_config)
-            cursor = self._source_conn.cursor()
-            cursor.execute(
-                "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
-                "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s "
-                "ORDER BY ORDINAL_POSITION",
-                (database, table)
-            )
-            columns = [row[0] for row in cursor.fetchall()]
-            cursor.close()
+            columns = []
+            for attempt in range(2):
+                try:
+                    if not self._source_conn:
+                        self._source_conn = mysql.connector.connect(**self.source_config)
+                    cursor = self._source_conn.cursor()
+                    cursor.execute(
+                        "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+                        "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s "
+                        "ORDER BY ORDINAL_POSITION",
+                        (database, table)
+                    )
+                    columns = [row[0] for row in cursor.fetchall()]
+                    cursor.close()
+                    break
+                except Exception:
+                    if attempt == 0:
+                        self._source_conn = None  # 下次重连
+                    else:
+                        raise
 
             if columns:
                 self._column_cache[cache_key] = columns
@@ -442,7 +451,7 @@ class MySQLBinlogSync:
             # 永久性错误：不重试，记一次日志并跳过后续同类操作
             is_permanent = any(kw in err_str for kw in (
                 "doesn't exist", "does not exist", "Duplicate column",
-                "Unknown column", "Duplicate key", "Duplicate entry",
+                "Duplicate key", "Duplicate entry",
             ))
             if is_permanent and db_table:
                 if db_table not in self._missing_tables:
