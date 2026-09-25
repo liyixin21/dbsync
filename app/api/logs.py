@@ -1,22 +1,31 @@
 """
-日志API
+日志 API：操作日志、登录日志、运行日志的查询与清理。
+
+修正旧实现的缺陷：logs.py 使用了未导入的 HTTPException，
+删除不存在的记录时会抛 NameError 并返回 500。
 """
 from datetime import datetime
-from typing import Optional, List
-from fastapi import APIRouter, Depends, Query
-from sqlalchemy.orm import Session
-from pydantic import BaseModel
+from typing import List, Optional
 
-from ..core.database import get_db
+from fastapi import APIRouter, Depends, Query, Request
+from pydantic import BaseModel
+from sqlalchemy import func
+from sqlalchemy.orm import Query as SAQuery, Session
+
 from ..core.config import now_beijing
-from ..models.database import OperationLog, LoginLog, RunLog, User
-from .auth import get_current_user
+from ..core.database import get_db
+from ..core.errors import BadRequestError, NotFoundError
+from ..core.pagination import Page, PageMeta, paginate
+from ..models.database import LoginLog, OperationLog, RunLog, User
+from ..services.audit import log_operation
+from .deps import client_ip, get_current_user
 
 router = APIRouter()
 
 
+# ============================================================ 模型
+
 class OperationLogResponse(BaseModel):
-    """操作日志响应模型"""
     id: int
     user_id: Optional[int] = None
     username: Optional[str] = None
@@ -27,13 +36,11 @@ class OperationLogResponse(BaseModel):
     detail: Optional[str] = None
     ip_address: Optional[str] = None
     created_at: datetime
-    
-    class Config:
-        from_attributes = True
+
+    model_config = {"from_attributes": True}
 
 
 class LoginLogResponse(BaseModel):
-    """登录日志响应模型"""
     id: int
     username: str
     ip_address: Optional[str] = None
@@ -41,13 +48,11 @@ class LoginLogResponse(BaseModel):
     success: bool
     failure_reason: Optional[str] = None
     created_at: datetime
-    
-    class Config:
-        from_attributes = True
+
+    model_config = {"from_attributes": True}
 
 
 class RunLogResponse(BaseModel):
-    """运行日志响应模型"""
     id: int
     task_type: str
     task_id: int
@@ -56,311 +61,263 @@ class RunLogResponse(BaseModel):
     message: str
     detail: Optional[str] = None
     created_at: datetime
-    
-    class Config:
-        from_attributes = True
+
+    model_config = {"from_attributes": True}
 
 
-class OperationLogListResponse(BaseModel):
-    """操作日志列表响应"""
-    total: int
-    items: List[OperationLogResponse]
+class LogStatisticsResponse(BaseModel):
+    operations: dict
+    logins: dict
+    runs: dict
 
 
-class LoginLogListResponse(BaseModel):
-    """登录日志列表响应"""
-    total: int
-    items: List[LoginLogResponse]
+class MessageResponse(BaseModel):
+    message: str
+    affected: Optional[int] = None
 
 
-class RunLogListResponse(BaseModel):
-    """运行日志列表响应"""
-    total: int
-    items: List[RunLogResponse]
+# ============================================================ 辅助
+
+def _parse_date(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
+    except ValueError:
+        return None
 
 
-@router.get("/operations", response_model=OperationLogListResponse)
+def _apply_dates(query: SAQuery, column, start: Optional[str], end: Optional[str]) -> SAQuery:
+    start_dt = _parse_date(start)
+    if start_dt:
+        query = query.filter(column >= start_dt)
+    end_dt = _parse_date(end)
+    if end_dt:
+        query = query.filter(column <= end_dt)
+    return query
+
+
+# ============================================================ 查询
+
+@router.get("/operations", response_model=Page[OperationLogResponse])
 async def list_operation_logs(
-    username: Optional[str] = None,
+    search: Optional[str] = Query(default=None, max_length=200),
     action: Optional[str] = None,
     resource_type: Optional[str] = None,
-    search: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    skip: int = Query(0, ge=0),
-    limit: int = Query(50, ge=1, le=200),
+    skip: int = 0,
+    limit: int = 50,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """获取操作日志列表"""
+    current_user: User = Depends(get_current_user),
+) -> Page[OperationLogResponse]:
     query = db.query(OperationLog)
-    
     if search:
-        # 全局搜索：匹配用户名、操作、资源类型、资源名称、详情
+        pattern = f"%{search}%"
         query = query.filter(
-            (OperationLog.username.contains(search)) |
-            (OperationLog.action.contains(search)) |
-            (OperationLog.resource_type.contains(search)) |
-            (OperationLog.resource_name.contains(search)) |
-            (OperationLog.detail.contains(search)) |
-            (OperationLog.ip_address.contains(search))
+            OperationLog.username.like(pattern)
+            | OperationLog.action.like(pattern)
+            | OperationLog.resource_type.like(pattern)
+            | OperationLog.resource_name.like(pattern)
+            | OperationLog.detail.like(pattern)
+            | OperationLog.ip_address.like(pattern)
         )
-    if username:
-        query = query.filter(OperationLog.username.contains(username))
     if action:
-        query = query.filter(OperationLog.action.contains(action))
+        query = query.filter(OperationLog.action == action)
     if resource_type:
         query = query.filter(OperationLog.resource_type == resource_type)
-    if start_date:
-        try:
-            start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
-            query = query.filter(OperationLog.created_at >= start_dt)
-        except ValueError:
-            pass
-    if end_date:
-        try:
-            end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
-            query = query.filter(OperationLog.created_at <= end_dt)
-        except ValueError:
-            pass
-    
-    total = query.count()
-    items = query.order_by(OperationLog.created_at.desc()).offset(skip).limit(limit).all()
-    
-    return OperationLogListResponse(total=total, items=items)
+    query = _apply_dates(query, OperationLog.created_at, start_date, end_date)
+    query = query.order_by(OperationLog.id.desc())
+
+    items, meta = paginate(query, skip, limit)
+    return Page[OperationLogResponse](
+        data=[OperationLogResponse.model_validate(row) for row in items], page=meta
+    )
 
 
-@router.get("/logins", response_model=LoginLogListResponse)
+@router.get("/logins", response_model=Page[LoginLogResponse])
 async def list_login_logs(
-    username: Optional[str] = None,
+    search: Optional[str] = Query(default=None, max_length=200),
     success: Optional[bool] = None,
-    search: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    skip: int = Query(0, ge=0),
-    limit: int = Query(50, ge=1, le=200),
+    skip: int = 0,
+    limit: int = 50,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """获取登录日志列表"""
+    current_user: User = Depends(get_current_user),
+) -> Page[LoginLogResponse]:
     query = db.query(LoginLog)
-    
     if search:
-        # 全局搜索：匹配用户名、IP、失败原因
+        pattern = f"%{search}%"
         query = query.filter(
-            (LoginLog.username.contains(search)) |
-            (LoginLog.ip_address.contains(search)) |
-            (LoginLog.failure_reason.contains(search))
+            LoginLog.username.like(pattern)
+            | LoginLog.ip_address.like(pattern)
+            | LoginLog.failure_reason.like(pattern)
         )
-    if username:
-        query = query.filter(LoginLog.username.contains(username))
     if success is not None:
         query = query.filter(LoginLog.success == success)
-    if start_date:
-        try:
-            start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
-            query = query.filter(LoginLog.created_at >= start_dt)
-        except ValueError:
-            pass
-    if end_date:
-        try:
-            end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
-            query = query.filter(LoginLog.created_at <= end_dt)
-        except ValueError:
-            pass
-    
-    total = query.count()
-    items = query.order_by(LoginLog.created_at.desc()).offset(skip).limit(limit).all()
-    
-    return LoginLogListResponse(total=total, items=items)
+    query = _apply_dates(query, LoginLog.created_at, start_date, end_date)
+    query = query.order_by(LoginLog.id.desc())
+
+    items, meta = paginate(query, skip, limit)
+    return Page[LoginLogResponse](
+        data=[LoginLogResponse.model_validate(row) for row in items], page=meta
+    )
 
 
-@router.get("/runs", response_model=RunLogListResponse)
+@router.get("/runs", response_model=Page[RunLogResponse])
 async def list_run_logs(
+    search: Optional[str] = Query(default=None, max_length=200),
     task_type: Optional[str] = None,
     task_id: Optional[int] = None,
     level: Optional[str] = None,
-    search: Optional[str] = None,
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
-    skip: int = Query(0, ge=0),
-    limit: int = Query(50, ge=1, le=200),
+    skip: int = 0,
+    limit: int = 50,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """获取运行日志列表"""
+    current_user: User = Depends(get_current_user),
+) -> Page[RunLogResponse]:
     query = db.query(RunLog)
-    
     if search:
-        # 全局搜索：匹配任务类型、任务名称、级别、消息、详情
+        pattern = f"%{search}%"
         query = query.filter(
-            (RunLog.task_type.contains(search)) |
-            (RunLog.task_name.contains(search)) |
-            (RunLog.level.contains(search)) |
-            (RunLog.message.contains(search)) |
-            (RunLog.detail.contains(search))
+            RunLog.task_name.like(pattern)
+            | RunLog.level.like(pattern)
+            | RunLog.message.like(pattern)
+            | RunLog.detail.like(pattern)
         )
     if task_type:
         query = query.filter(RunLog.task_type == task_type)
-    if task_id:
+    if task_id is not None:
         query = query.filter(RunLog.task_id == task_id)
     if level:
-        query = query.filter(RunLog.level == level)
-    if start_date:
-        try:
-            start_dt = datetime.fromisoformat(start_date.replace('Z', '+00:00'))
-            query = query.filter(RunLog.created_at >= start_dt)
-        except ValueError:
-            pass
-    if end_date:
-        try:
-            end_dt = datetime.fromisoformat(end_date.replace('Z', '+00:00'))
-            query = query.filter(RunLog.created_at <= end_dt)
-        except ValueError:
-            pass
-    
-    total = query.count()
-    items = query.order_by(RunLog.created_at.desc()).offset(skip).limit(limit).all()
-    
-    return RunLogListResponse(total=total, items=items)
+        query = query.filter(RunLog.level == level.upper())
+    query = _apply_dates(query, RunLog.created_at, start_date, end_date)
+    query = query.order_by(RunLog.id.desc())
+
+    items, meta = paginate(query, skip, limit)
+    return Page[RunLogResponse](
+        data=[RunLogResponse.model_validate(row) for row in items], page=meta
+    )
 
 
-@router.get("/statistics")
+@router.get("/statistics", response_model=LogStatisticsResponse)
 async def get_log_statistics(
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """获取日志统计信息"""
-    from sqlalchemy import func
-    from datetime import timedelta
-    
+    current_user: User = Depends(get_current_user),
+) -> LogStatisticsResponse:
     now = now_beijing()
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    week_start = today_start - timedelta(days=7)
-    
-    # 操作日志统计
-    total_operations = db.query(func.count(OperationLog.id)).scalar()
-    today_operations = db.query(func.count(OperationLog.id)).filter(
-        OperationLog.created_at >= today_start
-    ).scalar()
-    
-    # 登录日志统计
-    total_logins = db.query(func.count(LoginLog.id)).scalar()
-    failed_logins = db.query(func.count(LoginLog.id)).filter(
-        LoginLog.success == False
-    ).scalar()
-    today_logins = db.query(func.count(LoginLog.id)).filter(
-        LoginLog.created_at >= today_start
-    ).scalar()
-    
-    # 运行日志统计
-    total_runs = db.query(func.count(RunLog.id)).scalar()
-    error_runs = db.query(func.count(RunLog.id)).filter(
-        RunLog.level == "ERROR"
-    ).scalar()
-    
-    return {
-        "operations": {
-            "total": total_operations,
-            "today": today_operations
+
+    return LogStatisticsResponse(
+        operations={
+            "total": db.query(func.count(OperationLog.id)).scalar() or 0,
+            "today": db.query(func.count(OperationLog.id))
+            .filter(OperationLog.created_at >= today_start)
+            .scalar()
+            or 0,
         },
-        "logins": {
-            "total": total_logins,
-            "failed": failed_logins,
-            "today": today_logins
+        logins={
+            "total": db.query(func.count(LoginLog.id)).scalar() or 0,
+            "failed": db.query(func.count(LoginLog.id))
+            .filter(LoginLog.success == False)  # noqa: E712
+            .scalar()
+            or 0,
+            "today": db.query(func.count(LoginLog.id))
+            .filter(LoginLog.created_at >= today_start)
+            .scalar()
+            or 0,
         },
-        "runs": {
-            "total": total_runs,
-            "errors": error_runs
-        }
-    }
+        runs={
+            "total": db.query(func.count(RunLog.id)).scalar() or 0,
+            "errors": db.query(func.count(RunLog.id))
+            .filter(RunLog.level == "ERROR")
+            .scalar()
+            or 0,
+        },
+    )
 
 
-# ============================================================
-# 删除操作日志
-# ============================================================
+# ============================================================ 清理
+# 静态路径段（-clear）注册在参数化路径之前，避免被 /{log_id} 吞掉。
 
-@router.delete("/operations-clear")
+@router.delete("/operations-clear", response_model=MessageResponse)
 async def clear_operation_logs(
+    request: Request,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """清空所有操作日志"""
+    current_user: User = Depends(get_current_user),
+) -> MessageResponse:
     count = db.query(OperationLog).delete()
+    log_operation(db, current_user, "清空操作日志", "log", None, None, f"{count} 条",
+                  ip_address=client_ip(request))
     db.commit()
-    return {"message": f"已清空 {count} 条操作日志"}
+    return MessageResponse(message=f"已清空 {count} 条操作日志", affected=count)
 
 
-@router.delete("/operations/{log_id}")
+@router.delete("/logins-clear", response_model=MessageResponse)
+async def clear_login_logs(
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> MessageResponse:
+    count = db.query(LoginLog).delete()
+    log_operation(db, current_user, "清空登录日志", "log", None, None, f"{count} 条",
+                  ip_address=client_ip(request))
+    db.commit()
+    return MessageResponse(message=f"已清空 {count} 条登录日志", affected=count)
+
+
+@router.delete("/runs-clear", response_model=MessageResponse)
+async def clear_run_logs(
+    request: Request,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> MessageResponse:
+    count = db.query(RunLog).delete()
+    log_operation(db, current_user, "清空运行日志", "log", None, None, f"{count} 条",
+                  ip_address=client_ip(request))
+    db.commit()
+    return MessageResponse(message=f"已清空 {count} 条运行日志", affected=count)
+
+
+@router.delete("/operations/{log_id}", response_model=MessageResponse)
 async def delete_operation_log(
     log_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """删除单条操作日志"""
-    log = db.query(OperationLog).filter(OperationLog.id == log_id).first()
-    if not log:
-        raise HTTPException(status_code=404, detail="操作日志不存在")
-    db.delete(log)
+    current_user: User = Depends(get_current_user),
+) -> MessageResponse:
+    record = db.query(OperationLog).filter(OperationLog.id == log_id).first()
+    if record is None:
+        raise NotFoundError("操作日志不存在")
+    db.delete(record)
     db.commit()
-    return {"message": "删除成功"}
+    return MessageResponse(message="删除成功", affected=1)
 
 
-# ============================================================
-# 删除登录日志
-# ============================================================
-
-@router.delete("/logins-clear")
-async def clear_login_logs(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """清空所有登录日志"""
-    count = db.query(LoginLog).delete()
-    db.commit()
-    return {"message": f"已清空 {count} 条登录日志"}
-
-
-@router.delete("/logins/{log_id}")
+@router.delete("/logins/{log_id}", response_model=MessageResponse)
 async def delete_login_log(
     log_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """删除单条登录日志"""
-    log = db.query(LoginLog).filter(LoginLog.id == log_id).first()
-    if not log:
-        raise HTTPException(status_code=404, detail="登录日志不存在")
-    db.delete(log)
+    current_user: User = Depends(get_current_user),
+) -> MessageResponse:
+    record = db.query(LoginLog).filter(LoginLog.id == log_id).first()
+    if record is None:
+        raise NotFoundError("登录日志不存在")
+    db.delete(record)
     db.commit()
-    return {"message": "删除成功"}
+    return MessageResponse(message="删除成功", affected=1)
 
 
-# ============================================================
-# 删除运行日志
-# ============================================================
-
-@router.delete("/runs-clear")
-async def clear_run_logs(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """清空所有运行日志"""
-    count = db.query(RunLog).delete()
-    db.commit()
-    return {"message": f"已清空 {count} 条运行日志"}
-
-
-@router.delete("/runs/{log_id}")
+@router.delete("/runs/{log_id}", response_model=MessageResponse)
 async def delete_run_log(
     log_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """删除单条运行日志"""
-    log = db.query(RunLog).filter(RunLog.id == log_id).first()
-    if not log:
-        raise HTTPException(status_code=404, detail="运行日志不存在")
-    db.delete(log)
+    current_user: User = Depends(get_current_user),
+) -> MessageResponse:
+    record = db.query(RunLog).filter(RunLog.id == log_id).first()
+    if record is None:
+        raise NotFoundError("运行日志不存在")
+    db.delete(record)
     db.commit()
-    return {"message": "删除成功"}
+    return MessageResponse(message="删除成功", affected=1)

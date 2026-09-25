@@ -1,230 +1,332 @@
 """
-数据库管理API
-"""
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy.orm import Session
-from typing import List, Optional
-from pydantic import BaseModel
-from datetime import datetime
+数据库连接配置 API。
 
+相比旧实现：test-connection 现在需要认证（旧版本任何人可探测内网 MySQL）。
+"""
+from datetime import datetime
+from typing import List, Optional
+
+import mysql.connector
+from fastapi import APIRouter, Depends, Request
+from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+
+from ..core.crypto import CredentialDecryptError, decrypt, encrypt, is_encrypted
 from ..core.database import get_db
-from ..core.crypto import encrypt, decrypt
-from ..models.database import Database, DatabaseType, User
-from .auth import get_current_user, log_operation
+from ..core.errors import (
+    BadRequestError,
+    CredentialError,
+    DatabaseConnectionError,
+    DatabaseInUseError,
+    NameTakenError,
+    NotFoundError,
+)
+from ..models.database import BackupPlan, Database, DatabaseType, SyncTask, User
+from ..services.audit import log_operation
+from .deps import client_ip, get_current_user
 
 router = APIRouter()
 
 
+# ============================================================ 模型
+
 class DatabaseCreate(BaseModel):
-    """创建数据库请求模型"""
-    name: str
-    host: str
-    port: int = 3306
-    username: str
-    password: str
-    database_name: str
+    name: str = Field(min_length=1, max_length=100)
+    host: str = Field(min_length=1, max_length=255)
+    port: int = Field(default=3306, ge=1, le=65535)
+    username: str = Field(min_length=1, max_length=100)
+    password: str = Field(min_length=1, max_length=500)
+    database_name: str = Field(min_length=1, max_length=100)
     db_type: str = "mysql"
     is_active: bool = True
 
 
 class DatabaseUpdate(BaseModel):
-    """更新数据库请求模型"""
-    name: Optional[str] = None
-    host: Optional[str] = None
-    port: Optional[int] = None
-    username: Optional[str] = None
-    password: Optional[str] = None
-    database_name: Optional[str] = None
+    name: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    host: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    port: Optional[int] = Field(default=None, ge=1, le=65535)
+    username: Optional[str] = Field(default=None, min_length=1, max_length=100)
+    password: Optional[str] = Field(default=None, max_length=500)
+    database_name: Optional[str] = Field(default=None, min_length=1, max_length=100)
     db_type: Optional[str] = None
     is_active: Optional[bool] = None
 
 
 class DatabaseResponse(BaseModel):
-    """数据库响应模型"""
     id: int
     name: str
     host: str
-    port: int = 3306
+    port: int
     username: str
-    password_set: bool = False  # 是否已设置密码（不返回明文）
+    password_set: bool
     database_name: str
-    db_type: str = "mysql"
-    is_active: bool = True
+    db_type: str
+    is_active: bool
     created_at: datetime
     updated_at: datetime
 
-    class Config:
-        from_attributes = True
-
 
 class TestConnectionRequest(BaseModel):
-    """测试连接请求模型"""
-    host: str
-    port: int = 3306
-    username: str
-    password: str
-    database_name: str
+    """连接测试。支持两种模式：直接给明文，或引用已保存的数据库（密码留空）。"""
 
+    host: str = Field(min_length=1, max_length=255)
+    port: int = Field(default=3306, ge=1, le=65535)
+    username: str = Field(min_length=1, max_length=100)
+    password: str = Field(default="", max_length=500)
+    database_name: str = Field(min_length=1, max_length=100)
+    database_id: Optional[int] = Field(
+        default=None, description="编辑已有数据库且未改密码时传入，用已存密码测试"
+    )
+
+
+class TestConnectionResponse(BaseModel):
+    success: bool
+    message: str
+    server_version: Optional[str] = None
+
+
+class MessageResponse(BaseModel):
+    message: str
+
+
+# ============================================================ 辅助
+
+def _to_response(db: Database) -> DatabaseResponse:
+    return DatabaseResponse(
+        id=db.id,
+        name=db.name,
+        host=db.host,
+        port=db.port,
+        username=db.username,
+        password_set=bool(db.password),
+        database_name=db.database_name,
+        db_type=db.db_type.value if db.db_type else "mysql",
+        is_active=db.is_active,
+        created_at=db.created_at,
+        updated_at=db.updated_at,
+    )
+
+
+def _assert_name_free(db: Session, name: str, exclude_id: Optional[int] = None) -> None:
+    query = db.query(Database).filter(Database.name == name)
+    if exclude_id is not None:
+        query = query.filter(Database.id != exclude_id)
+    if query.first() is not None:
+        raise NameTakenError(f"数据库名称「{name}」已存在")
+
+
+def _resolve_stored_password(payload: TestConnectionRequest, db: Session) -> str:
+    """密码留空且给了 database_id 时，取用已保存的凭据。"""
+    if payload.password:
+        return payload.password
+    if payload.database_id is None:
+        raise BadRequestError("请输入密码")
+
+    record = db.query(Database).filter(Database.id == payload.database_id).first()
+    if record is None:
+        raise NotFoundError("引用的数据库配置不存在")
+    try:
+        return decrypt(record.password)
+    except CredentialDecryptError as exc:
+        raise CredentialError(str(exc)) from exc
+
+
+# ============================================================ 端点
 
 @router.get("/", response_model=List[DatabaseResponse])
 async def list_databases(
     skip: int = 0,
-    limit: int = 100,
+    limit: int = 200,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """获取数据库列表"""
-    databases = db.query(Database).offset(skip).limit(limit).all()
-    results = []
-    for d in databases:
-        results.append(DatabaseResponse(
-            id=d.id, name=d.name, host=d.host, port=d.port,
-            username=d.username, password_set=bool(d.password),
-            database_name=d.database_name, db_type=d.db_type.value if d.db_type else "mysql",
-            is_active=d.is_active, created_at=d.created_at, updated_at=d.updated_at
-        ))
-    return results
+    current_user: User = Depends(get_current_user),
+) -> List[DatabaseResponse]:
+    """数据库配置列表。"""
+    rows = db.query(Database).order_by(Database.id).offset(max(0, skip)).limit(
+        max(1, min(limit, 500))
+    ).all()
+    return [_to_response(row) for row in rows]
+
+
+@router.post("/test-connection", response_model=TestConnectionResponse)
+async def test_connection(
+    payload: TestConnectionRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> TestConnectionResponse:
+    """
+    测试 MySQL 连接。
+
+    注意：本端点在旧版本中缺失认证依赖，任何未登录用户都能用它探测内网数据库。
+    """
+    password = _resolve_stored_password(payload, db)
+
+    try:
+        conn = mysql.connector.connect(
+            host=payload.host,
+            port=payload.port,
+            user=payload.username,
+            password=password,
+            database=payload.database_name,
+            connection_timeout=8,
+            connect_timeout=8,
+            ssl_disabled=True,
+        )
+    except mysql.connector.Error as exc:
+        return TestConnectionResponse(success=False, message=f"连接失败: {_compact(exc)}")
+    except Exception as exc:
+        return TestConnectionResponse(success=False, message=f"连接失败: {exc}")
+
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT VERSION()")
+        version = cursor.fetchone()
+        cursor.close()
+    except Exception:
+        version = None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    server_version = version[0] if version else None
+    suffix = f"，服务端版本 {server_version}" if server_version else ""
+    return TestConnectionResponse(
+        success=True, message=f"连接成功{suffix}", server_version=server_version
+    )
+
+
+def _compact(exc: Exception) -> str:
+    text = str(exc)
+    return text if len(text) <= 300 else text[:300] + "..."
 
 
 @router.get("/{database_id}", response_model=DatabaseResponse)
-async def get_database(database_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    """获取单个数据库信息"""
-    d = db.query(Database).filter(Database.id == database_id).first()
-    if not d:
-        raise HTTPException(status_code=404, detail="数据库不存在")
-    return DatabaseResponse(
-        id=d.id, name=d.name, host=d.host, port=d.port,
-        username=d.username, password_set=bool(d.password),
-        database_name=d.database_name, db_type=d.db_type.value if d.db_type else "mysql",
-        is_active=d.is_active, created_at=d.created_at, updated_at=d.updated_at
-    )
+async def get_database(
+    database_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> DatabaseResponse:
+    record = db.query(Database).filter(Database.id == database_id).first()
+    if record is None:
+        raise NotFoundError("数据库不存在")
+    return _to_response(record)
 
 
 @router.post("/", response_model=DatabaseResponse)
 async def create_database(
-    database: DatabaseCreate, 
+    payload: DatabaseCreate,
+    request: Request,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """创建数据库配置"""
-    # 检查名称是否重复
-    existing = db.query(Database).filter(Database.name == database.name).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="数据库名称已存在")
-    
-    db_database = Database(
-        name=database.name,
-        host=database.host,
-        port=database.port,
-        username=database.username,
-        password=encrypt(database.password),
-        database_name=database.database_name,
-        db_type=DatabaseType(database.db_type),
-        is_active=database.is_active
+    current_user: User = Depends(get_current_user),
+) -> DatabaseResponse:
+    """新增数据库配置。密码加密存储。"""
+    _assert_name_free(db, payload.name)
+
+    try:
+        db_type = DatabaseType(payload.db_type)
+    except ValueError:
+        raise BadRequestError(f"不支持的数据库类型: {payload.db_type}")
+
+    record = Database(
+        name=payload.name,
+        host=payload.host,
+        port=payload.port,
+        username=payload.username,
+        password=encrypt(payload.password),
+        database_name=payload.database_name,
+        db_type=db_type,
+        is_active=payload.is_active,
     )
-    db.add(db_database)
+    db.add(record)
+    db.flush()
+
+    log_operation(
+        db, current_user, "创建数据库", "database", record.id, record.name,
+        f"{record.host}:{record.port}/{record.database_name}", ip_address=client_ip(request),
+    )
     db.commit()
-    db.refresh(db_database)
-    
-    log_operation(db, current_user, "创建数据库", "database", db_database.id, db_database.name)
-    
-    return db_database
+    db.refresh(record)
+    return _to_response(record)
 
 
 @router.put("/{database_id}", response_model=DatabaseResponse)
 async def update_database(
     database_id: int,
-    database: DatabaseUpdate,
+    payload: DatabaseUpdate,
+    request: Request,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """更新数据库配置"""
-    db_database = db.query(Database).filter(Database.id == database_id).first()
-    if not db_database:
-        raise HTTPException(status_code=404, detail="数据库不存在")
-    
-    # 更新字段
-    if database.name is not None:
-        # 检查名称是否重复
-        existing = db.query(Database).filter(
-            Database.name == database.name,
-            Database.id != database_id
-        ).first()
-        if existing:
-            raise HTTPException(status_code=400, detail="数据库名称已存在")
-        db_database.name = database.name
-    
-    if database.host is not None:
-        db_database.host = database.host
-    if database.port is not None:
-        db_database.port = database.port
-    if database.username is not None:
-        db_database.username = database.username
-    if database.password is not None:
-        db_database.password = encrypt(database.password)
-    if database.database_name is not None:
-        db_database.database_name = database.database_name
-    if database.db_type is not None:
-        db_database.db_type = DatabaseType(database.db_type)
-    if database.is_active is not None:
-        db_database.is_active = database.is_active
-    
+    current_user: User = Depends(get_current_user),
+) -> DatabaseResponse:
+    """更新数据库配置。密码留空表示不修改。"""
+    record = db.query(Database).filter(Database.id == database_id).first()
+    if record is None:
+        raise NotFoundError("数据库不存在")
+
+    if payload.name is not None:
+        _assert_name_free(db, payload.name, exclude_id=database_id)
+        record.name = payload.name
+    if payload.host is not None:
+        record.host = payload.host
+    if payload.port is not None:
+        record.port = payload.port
+    if payload.username is not None:
+        record.username = payload.username
+    if payload.password:
+        record.password = encrypt(payload.password)
+    if payload.database_name is not None:
+        record.database_name = payload.database_name
+    if payload.db_type is not None:
+        try:
+            record.db_type = DatabaseType(payload.db_type)
+        except ValueError:
+            raise BadRequestError(f"不支持的数据库类型: {payload.db_type}")
+    if payload.is_active is not None:
+        record.is_active = payload.is_active
+
+    log_operation(
+        db, current_user, "更新数据库", "database", record.id, record.name,
+        ip_address=client_ip(request),
+    )
     db.commit()
-    db.refresh(db_database)
-    
-    log_operation(db, current_user, "更新数据库", "database", db_database.id, db_database.name)
-    
-    return db_database
+    db.refresh(record)
+    return _to_response(record)
 
 
-@router.delete("/{database_id}")
+@router.delete("/{database_id}", response_model=MessageResponse)
 async def delete_database(
-    database_id: int, 
+    database_id: int,
+    request: Request,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """删除数据库配置"""
-    db_database = db.query(Database).filter(Database.id == database_id).first()
-    if not db_database:
-        raise HTTPException(status_code=404, detail="数据库不存在")
-    
-    # 检查是否有关联的同步任务或备份计划
-    from ..models.database import SyncTask, BackupPlan
-    sync_tasks = db.query(SyncTask).filter(
-        (SyncTask.source_db_id == database_id) | (SyncTask.target_db_id == database_id)
-    ).count()
-    backup_plans = db.query(BackupPlan).filter(BackupPlan.database_id == database_id).count()
-    
-    if sync_tasks > 0 or backup_plans > 0:
-        raise HTTPException(
-            status_code=400,
-            detail="该数据库存在关联的同步任务或备份计划，无法删除"
+    current_user: User = Depends(get_current_user),
+) -> MessageResponse:
+    """删除数据库配置。存在关联任务时拒绝。"""
+    record = db.query(Database).filter(Database.id == database_id).first()
+    if record is None:
+        raise NotFoundError("数据库不存在")
+
+    sync_count = (
+        db.query(SyncTask)
+        .filter(
+            (SyncTask.source_db_id == database_id) | (SyncTask.target_db_id == database_id)
         )
-    
-    db_name = db_database.name
-    db.delete(db_database)
+        .count()
+    )
+    plan_count = db.query(BackupPlan).filter(BackupPlan.database_id == database_id).count()
+
+    if sync_count or plan_count:
+        parts = []
+        if sync_count:
+            parts.append(f"{sync_count} 个同步任务")
+        if plan_count:
+            parts.append(f"{plan_count} 个备份计划")
+        raise DatabaseInUseError(
+            f"该数据库被 {' 和 '.join(parts)} 引用，请先删除或改绑相关配置"
+        )
+
+    name = record.name
+    db.delete(record)
+    log_operation(db, current_user, "删除数据库", "database", database_id, name,
+                  ip_address=client_ip(request))
     db.commit()
-    
-    log_operation(db, current_user, "删除数据库", "database", database_id, db_name)
-    
-    return {"message": "删除成功"}
-
-
-@router.post("/test-connection")
-async def test_connection(request: TestConnectionRequest):
-    """测试数据库连接"""
-    try:
-        import mysql.connector
-        connection = mysql.connector.connect(
-            host=request.host,
-            port=request.port,
-            user=request.username,
-            password=request.password,
-            database=request.database_name,
-            connection_timeout=5,
-            ssl_disabled=True
-        )
-        connection.close()
-        return {"success": True, "message": "连接成功"}
-    except Exception as e:
-        return {"success": False, "message": f"连接失败: {str(e)}"}
+    return MessageResponse(message="删除成功")

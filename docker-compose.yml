@@ -1,23 +1,22 @@
 services:
   dbsync:
     build: .
+    image: dbsync:latest
     container_name: dbsync
     ports:
       - "8000:8000"
     volumes:
       - ./data:/app/data
       - ./backups:/app/backups
-      - /etc/localtime:/etc/localtime:ro  # 同步宿主机时区
+      - /etc/localtime:/etc/localtime:ro
     environment:
       - HOST=0.0.0.0
       - PORT=8000
       - DEBUG=false
-      - SECRET_KEY=change-this-to-a-random-secret-key # 生成方式: python -c "import secrets; print(secrets.token_urlsafe(32))"
-      - TZ=Asia/Shanghai  # 设置时区为北京时间
+      # 必填。生产模式下未设置或过短会导致服务拒绝启动。
+      # 生成: python -c "import secrets; print(secrets.token_urlsafe(32))"
+      - SECRET_KEY=${SECRET_KEY:?SECRET_KEY 必须设置，生成方式: python -c "import secrets; print(secrets.token_urlsafe(32))"}
+      - BACKUP_DIR=/app/backups
+      - LOG_LEVEL=INFO
+      - TZ=Asia/Shanghai
     restart: unless-stopped
-    networks:
-      - dbsync-net
-
-networks:
-  dbsync-net:
-    driver: bridge

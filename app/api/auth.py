@@ -1,297 +1,274 @@
 """
-用户认证API
-"""
-from datetime import datetime, timedelta
-from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, Request, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from sqlalchemy.orm import Session
-from pydantic import BaseModel
-from jose import JWTError, jwt
-from passlib.context import CryptContext
+用户认证 API。
 
+相比旧实现新增登录失败限流：旧代码记录了失败登录却从不据此决策，
+密码可被无限次暴力尝试。
+"""
+from datetime import datetime
+from typing import List, Optional
+
+from fastapi import APIRouter, Depends, Request
+from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+
+from ..core.config import now_beijing, settings
 from ..core.database import get_db
-from ..core.config import settings, now_beijing
-from ..models.database import User, LoginLog, OperationLog
+from ..core.errors import AuthError, BadRequestError, ConflictError, RateLimitError
+from ..core.security import (
+    create_access_token,
+    hash_password,
+    login_rate_limiter,
+    verify_password,
+)
+from ..models.database import User
+from ..services.audit import log_login, log_operation
+from .deps import client_ip, get_current_user
 
 router = APIRouter()
-security = HTTPBearer()
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
-# JWT 配置
-ALGORITHM = "HS256"
 
+# ============================================================ 模型
 
 class LoginRequest(BaseModel):
-    """登录请求模型"""
-    username: str
-    password: str
+    username: str = Field(min_length=1, max_length=50)
+    password: str = Field(min_length=1, max_length=200)
 
 
 class LoginResponse(BaseModel):
-    """登录响应模型"""
     access_token: str
     token_type: str = "bearer"
     username: str
-
-
-class UserCreate(BaseModel):
-    """创建用户请求模型"""
-    username: str
-    password: str
-
-
-class ChangeUsernameRequest(BaseModel):
-    """修改用户名请求模型"""
-    password: str
-    new_username: str
-
-
-class ChangePasswordRequest(BaseModel):
-    """修改密码请求模型"""
-    old_password: str
-    new_password: str
+    expires_in: int
 
 
 class UserResponse(BaseModel):
-    """用户响应模型"""
     id: int
     username: str
     is_active: bool
     created_at: datetime
     last_login: Optional[datetime] = None
-    
-    class Config:
-        from_attributes = True
+
+    model_config = {"from_attributes": True}
 
 
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None, token_version: int = 0):
-    """创建 JWT token，包含令牌版本号用于支持主动失效"""
-    to_encode = data.copy()
-    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES))
-    to_encode.update({"exp": expire, "ver": token_version})
-    return jwt.encode(to_encode, settings.SECRET_KEY, algorithm=ALGORITHM)
+class UserCreateRequest(BaseModel):
+    username: str = Field(min_length=3, max_length=50)
+    password: str = Field(min_length=6, max_length=200)
 
 
-def verify_token(token: str) -> dict:
-    """验证 JWT token"""
-    try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[ALGORITHM])
-        return payload
-    except JWTError:
-        raise HTTPException(status_code=401, detail="无效的认证凭据")
+class ChangeUsernameRequest(BaseModel):
+    password: str
+    new_username: str = Field(min_length=3, max_length=50)
 
 
-async def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-    db: Session = Depends(get_db)
-) -> User:
-    """获取当前认证用户，同时校验令牌版本号"""
-    payload = verify_token(credentials.credentials)
-    username = payload.get("sub")
-    if not username:
-        raise HTTPException(status_code=401, detail="无效的认证凭据")
-    
-    user = db.query(User).filter(User.username == username).first()
-    if not user or not user.is_active:
-        raise HTTPException(status_code=401, detail="用户不存在或已禁用")
-    
-    # 校验令牌版本号（用户名/密码变更后旧令牌自动失效）
-    token_ver = payload.get("ver", 0)
-    if token_ver != (user.token_version or 0):
-        raise HTTPException(status_code=401, detail="令牌已失效，请重新登录")
-    
-    return user
+class ChangePasswordRequest(BaseModel):
+    old_password: str
+    new_password: str = Field(min_length=6, max_length=200)
 
 
-def log_operation(db: Session, user: User, action: str, resource_type: str = None, 
-                  resource_id: int = None, resource_name: str = None, 
-                  detail: str = None, ip_address: str = None):
-    """记录操作日志"""
-    log = OperationLog(
-        user_id=user.id,
-        username=user.username,
-        action=action,
-        resource_type=resource_type,
-        resource_id=resource_id,
-        resource_name=resource_name,
-        detail=detail,
-        ip_address=ip_address
-    )
-    db.add(log)
-    db.commit()
+class TokenResponse(BaseModel):
+    message: str
+    access_token: Optional[str] = None
+    username: Optional[str] = None
 
+
+class MessageResponse(BaseModel):
+    message: str
+
+
+# ============================================================ 登录
 
 @router.post("/login", response_model=LoginResponse)
-async def login(request: Request, login_data: LoginRequest, db: Session = Depends(get_db)):
-    """用户登录"""
-    ip_address = request.client.host if request.client else "unknown"
+async def login(
+    payload: LoginRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+) -> LoginResponse:
+    """用户登录。连续失败超过阈值触发限流。"""
+    ip = client_ip(request)
     user_agent = request.headers.get("user-agent", "")
-    
-    # 查找用户
-    user = db.query(User).filter(User.username == login_data.username).first()
-    
-    # 验证密码
-    if not user or not pwd_context.verify(login_data.password, user.password_hash):
-        # 记录失败登录
-        login_log = LoginLog(
-            username=login_data.username,
-            ip_address=ip_address,
-            user_agent=user_agent,
-            success=False,
-            failure_reason="用户名或密码错误"
+    limiter_key = f"{payload.username}@{ip}"
+
+    allowed, retry_after = login_rate_limiter.check(limiter_key)
+    if not allowed:
+        log_login(
+            db, payload.username, ip, user_agent, False,
+            f"登录过于频繁（{retry_after}s 后重试）",
         )
-        db.add(login_log)
         db.commit()
-        raise HTTPException(status_code=401, detail="用户名或密码错误")
-    
+        raise RateLimitError(f"登录尝试过于频繁，请 {retry_after} 秒后重试")
+
+    user = db.query(User).filter(User.username == payload.username).first()
+
+    # 无论用户是否存在都执行一次哈希校验，避免通过响应时间区分账号是否存在
+    password_ok = verify_password(payload.password, user.password_hash) if user else False
+    if user is None:
+        hash_password(payload.password)  # 拉平时序
+
+    if not password_ok:
+        login_rate_limiter.record_failure(limiter_key)
+        log_login(db, payload.username, ip, user_agent, False, "用户名或密码错误")
+        db.commit()
+        raise AuthError("用户名或密码错误")
+
     if not user.is_active:
-        login_log = LoginLog(
-            username=login_data.username,
-            ip_address=ip_address,
-            user_agent=user_agent,
-            success=False,
-            failure_reason="账户已禁用"
-        )
-        db.add(login_log)
+        log_login(db, payload.username, ip, user_agent, False, "账户已禁用")
         db.commit()
-        raise HTTPException(status_code=403, detail="账户已禁用")
-    
-    # 创建 token（包含令牌版本号）
-    access_token = create_access_token(data={"sub": user.username}, token_version=user.token_version or 0)
-    
-    # 更新最后登录时间
+        raise BadRequestError("账户已被禁用")
+
+    login_rate_limiter.reset(limiter_key)
+
+    token = create_access_token(user.username, user.token_version or 0)
     user.last_login = now_beijing()
-    
-    # 记录成功登录
-    login_log = LoginLog(
-        username=user.username,
-        ip_address=ip_address,
-        user_agent=user_agent,
-        success=True
-    )
-    db.add(login_log)
+    log_login(db, user.username, ip, user_agent, True)
     db.commit()
-    
-    return LoginResponse(access_token=access_token, username=user.username)
+
+    return LoginResponse(
+        access_token=token,
+        username=user.username,
+        expires_in=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+    )
 
 
 @router.get("/me", response_model=UserResponse)
-async def get_me(current_user: User = Depends(get_current_user)):
-    """获取当前用户信息"""
+async def get_me(current_user: User = Depends(get_current_user)) -> User:
+    """当前登录用户。"""
     return current_user
+
+
+# ============================================================ 用户管理
+
+@router.get("/users", response_model=List[UserResponse])
+async def list_users(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> List[User]:
+    return db.query(User).order_by(User.id).all()
 
 
 @router.post("/users", response_model=UserResponse)
 async def create_user(
-    user_data: UserCreate,
+    payload: UserCreateRequest,
+    request: Request,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """创建用户（需要认证）"""
-    # 检查用户名是否已存在
-    existing = db.query(User).filter(User.username == user_data.username).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="用户名已存在")
-    
-    # 创建用户
+    current_user: User = Depends(get_current_user),
+) -> User:
+    """创建用户。"""
+    existing = db.query(User).filter(User.username == payload.username).first()
+    if existing is not None:
+        raise ConflictError("用户名已存在")
+
     user = User(
-        username=user_data.username,
-        password_hash=pwd_context.hash(user_data.password)
+        username=payload.username,
+        password_hash=hash_password(payload.password),
     )
     db.add(user)
+    db.flush()
+
+    log_operation(
+        db, current_user, "创建用户", "user", user.id, user.username,
+        ip_address=client_ip(request),
+    )
     db.commit()
     db.refresh(user)
-    
-    log_operation(db, current_user, "创建用户", "user", user.id, user.username)
-    
     return user
 
 
-@router.get("/users", response_model=list[UserResponse])
-async def list_users(
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """获取用户列表"""
-    return db.query(User).all()
-
-
-@router.put("/users/{user_id}/toggle")
+@router.put("/users/{user_id}/toggle", response_model=MessageResponse)
 async def toggle_user(
     user_id: int,
+    request: Request,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """启用/禁用用户"""
+    current_user: User = Depends(get_current_user),
+) -> MessageResponse:
+    """启用/禁用用户。"""
+    if user_id == current_user.id:
+        raise BadRequestError("不能禁用当前登录账户")
+
     user = db.query(User).filter(User.id == user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="用户不存在")
-    
+    if user is None:
+        from ..core.errors import NotFoundError
+
+        raise NotFoundError("用户不存在")
+
     user.is_active = not user.is_active
-    db.commit()
-    
+    if not user.is_active:
+        # 禁用后立即使其所有已签发令牌失效
+        user.token_version = (user.token_version or 0) + 1
+
     action = "启用用户" if user.is_active else "禁用用户"
-    log_operation(db, current_user, action, "user", user.id, user.username)
-    
-    return {"message": f"用户已{'启用' if user.is_active else '禁用'}"}
+    log_operation(
+        db, current_user, action, "user", user.id, user.username,
+        ip_address=client_ip(request),
+    )
+    db.commit()
+    return MessageResponse(message=f"用户已{action[2:]}")
 
 
-@router.put("/change-username")
+# ============================================================ 凭据变更
+
+@router.put("/change-username", response_model=TokenResponse)
 async def change_username(
-    data: ChangeUsernameRequest,
+    payload: ChangeUsernameRequest,
+    request: Request,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """修改当前用户用户名"""
-    # 验证密码
-    if not pwd_context.verify(data.password, current_user.password_hash):
-        raise HTTPException(status_code=400, detail="密码错误")
-    
-    # 检查新用户名是否已存在
-    if len(data.new_username) < 3:
-        raise HTTPException(status_code=400, detail="用户名至少3个字符")
-    
-    existing = db.query(User).filter(User.username == data.new_username).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="用户名已存在")
-    
+    current_user: User = Depends(get_current_user),
+) -> TokenResponse:
+    """修改用户名。成功后旧令牌失效并返回新令牌。"""
+    if not verify_password(payload.password, current_user.password_hash):
+        raise BadRequestError("密码错误")
+
+    if payload.new_username == current_user.username:
+        raise BadRequestError("新用户名与当前用户名相同")
+
+    existing = (
+        db.query(User)
+        .filter(User.username == payload.new_username, User.id != current_user.id)
+        .first()
+    )
+    if existing is not None:
+        raise ConflictError("用户名已被占用")
+
     old_username = current_user.username
-    current_user.username = data.new_username
+    current_user.username = payload.new_username
     current_user.token_version = (current_user.token_version or 0) + 1
+
+    log_operation(
+        db, current_user, "修改用户名", "user", current_user.id, payload.new_username,
+        f"{old_username} → {payload.new_username}", ip_address=client_ip(request),
+    )
     db.commit()
-    
-    log_operation(db, current_user, "修改用户名", "user", current_user.id, 
-                  f"{old_username} -> {data.new_username}")
-    
-    # 生成新token（使用新的令牌版本号）
-    access_token = create_access_token(data={"sub": data.new_username}, token_version=current_user.token_version)
-    
-    return {"message": "用户名修改成功", "access_token": access_token, "username": data.new_username}
+
+    token = create_access_token(current_user.username, current_user.token_version)
+    return TokenResponse(
+        message="用户名修改成功", access_token=token, username=current_user.username
+    )
 
 
-@router.put("/change-password")
+@router.put("/change-password", response_model=TokenResponse)
 async def change_password(
-    data: ChangePasswordRequest,
+    payload: ChangePasswordRequest,
+    request: Request,
     db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user)
-):
-    """修改当前用户密码"""
-    # 验证旧密码
-    if not pwd_context.verify(data.old_password, current_user.password_hash):
-        raise HTTPException(status_code=400, detail="旧密码错误")
-    
-    # 检查新密码长度
-    if len(data.new_password) < 6:
-        raise HTTPException(status_code=400, detail="新密码至少6个字符")
-    
-    current_user.password_hash = pwd_context.hash(data.new_password)
+    current_user: User = Depends(get_current_user),
+) -> TokenResponse:
+    """修改密码。旧令牌因版本号不匹配自动失效。"""
+    if not verify_password(payload.old_password, current_user.password_hash):
+        raise BadRequestError("旧密码错误")
+
+    if payload.old_password == payload.new_password:
+        raise BadRequestError("新密码不能与旧密码相同")
+
+    current_user.password_hash = hash_password(payload.new_password)
     current_user.token_version = (current_user.token_version or 0) + 1
+
+    log_operation(
+        db, current_user, "修改密码", "user", current_user.id, current_user.username,
+        ip_address=client_ip(request),
+    )
     db.commit()
-    
-    log_operation(db, current_user, "修改密码", "user", current_user.id, current_user.username)
-    
-    # 生成新token（旧令牌因版本号不匹配将自动失效）
-    access_token = create_access_token(data={"sub": current_user.username}, token_version=current_user.token_version)
-    
-    return {"message": "密码修改成功", "access_token": access_token}
+
+    token = create_access_token(current_user.username, current_user.token_version)
+    return TokenResponse(
+        message="密码修改成功", access_token=token, username=current_user.username
+    )

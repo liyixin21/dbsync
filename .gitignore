@@ -15,10 +15,21 @@ env/
 
 # 应用数据
 data/
-backups/*.sql
+backups/
+
+# 前端
+node_modules/
+frontend/dist/
+.vite/
+*.tsbuildinfo
 
 # 日志
 *.log
+
+# 测试与缓存
+.pytest_cache/
+.coverage
+htmlcov/
 
 # IDE
 .vscode/
@@ -30,8 +41,10 @@ backups/*.sql
 .DS_Store
 Thumbs.db
 
-# 测试（包含硬编码测试数据，不上传）
-tests/
+# 本地环境配置（含密钥，绝不提交）
+.env
+.env.local
+.env.*.local
 
-# CodeBuddy
-.codebuddy/
+# 重构过程文档（本地保留，不入版本库）
+REFACTOR_PLAN.md

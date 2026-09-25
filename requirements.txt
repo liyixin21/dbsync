@@ -1,21 +1,30 @@
+# Web 框架
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
+
+# 控制面存储
 sqlalchemy==2.0.23
-aiosqlite==0.19.0
-python-multipart==0.0.6
-jinja2==3.1.2
+pydantic==2.5.2
+pydantic-settings==2.1.0
+
+# 认证与加密
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
 bcrypt==4.0.1
-python-dotenv==1.0.0
+cryptography==41.0.7
+
+# MySQL 同步与备份
 mysql-connector-python==8.2.0
 pymysql==1.1.0
-cryptography==41.0.7
-schedule==1.2.1
-loguru==0.7.2
-pydantic==2.5.2
-pydantic-settings==2.1.0
-httpx==0.25.2
-websockets==12.0
-psutil==5.9.7
 mysql-replication==1.0.5
+
+# OpenList 备份上传（运行时依赖）+ 测试客户端
+httpx==0.25.2
+
+# 调度与可观测
+APScheduler==3.10.4
+loguru==0.7.2
+psutil==5.9.7
+
+# 测试（开发环境）
+pytest==9.1.1
