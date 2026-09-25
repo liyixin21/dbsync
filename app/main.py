@@ -44,8 +44,30 @@ def _serve_index():
 
 # ============================================================ 日志
 
+def _check_writable(directory: str) -> bool:
+    """检测目录是否可写。"""
+    try:
+        os.makedirs(directory, exist_ok=True)
+        probe = os.path.join(directory, ".write-probe")
+        with open(probe, "w") as fh:
+            fh.write("")
+        os.unlink(probe)
+        return True
+    except OSError:
+        return False
+
+
 def _configure_logging() -> None:
-    os.makedirs(os.path.dirname(os.path.abspath(settings.LOG_FILE)), exist_ok=True)
+    """
+    配置日志。
+
+    文件日志失败**不会**导致启动中止：控制台输出才是容器运维的主要入口，
+    因挂载目录权限问题（宿主机目录属主与容器内 UID 不一致）而拒绝启动，
+    代价远大于失去文件日志。此时会打印清晰的排查指引。
+    """
+    log_dir = os.path.dirname(os.path.abspath(settings.LOG_FILE))
+    os.makedirs(log_dir, exist_ok=True)
+
     logger.remove()
     logger.add(
         sink=lambda msg: print(msg, end=""),
@@ -54,18 +76,36 @@ def _configure_logging() -> None:
                "<level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{line}</cyan> - {message}",
         colorize=True,
     )
-    logger.add(
-        settings.LOG_FILE,
-        rotation="10 MB",
-        retention="30 days",
-        compression="gz",
-        encoding="utf-8",
-        level=settings.LOG_LEVEL,
-        format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
-        enqueue=True,
-        backtrace=True,
-        diagnose=False,
-    )
+
+    if not _check_writable(log_dir):
+        uid = os.getuid() if hasattr(os, "getuid") else "?"
+        gid = os.getgid() if hasattr(os, "getgid") else "?"
+        logger.warning(
+            f"日志目录不可写，已跳过文件日志：{log_dir}\n"
+            f"  当前进程 UID:GID = {uid}:{gid}\n"
+            "  常见原因：容器以非 root 用户运行，而挂载的宿主机目录属主不同。\n"
+            "  修复方式（在宿主机执行其一）：\n"
+            f"    sudo chown -R {uid}:{gid} ./data ./backups\n"
+            "    或在 compose 中为该服务指定 user: \"root\""
+        )
+        return
+
+    try:
+        logger.add(
+            settings.LOG_FILE,
+            rotation="10 MB",
+            retention="30 days",
+            compression="gz",
+            encoding="utf-8",
+            level=settings.LOG_LEVEL,
+            format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}",
+            enqueue=True,
+            backtrace=True,
+            diagnose=False,
+        )
+    except (OSError, PermissionError) as exc:
+        # 兜底：即便探测通过，实际创建文件仍可能失败（如磁盘只读）
+        logger.warning(f"无法写入日志文件 {settings.LOG_FILE}：{exc}（已仅使用控制台日志）")
 
 
 # ============================================================ 后台服务协调
@@ -90,6 +130,26 @@ async def lifespan(app: FastAPI):
     settings.validate_for_startup()
 
     logger.info(f"启动 {settings.APP_NAME} v{settings.APP_VERSION}")
+
+    # 路径可写性自检：把权限问题连同修复命令在启动时讲清楚。
+    # 这类问题在挂载卷场景很常见（宿主机目录属主与容器内 UID 不一致），
+    # 若不提前检查，会以难以定位的写入错误出现在运行中途。
+    from .core.database import check_writable_paths
+
+    unwritable = check_writable_paths()
+    if unwritable:
+        uid = os.getuid() if hasattr(os, "getuid") else "?"
+        gid = os.getgid() if hasattr(os, "getgid") else "?"
+        details = "\n".join(f"    {label} {path} — {err}" for label, path, err in unwritable)
+        raise RuntimeError(
+            "以下目录不可写，服务无法启动：\n"
+            f"{details}\n\n"
+            f"  当前进程 UID:GID = {uid}:{gid}\n"
+            "  常见原因：容器以非 root 用户运行，而挂载的宿主机目录属主不同。\n"
+            "  修复方式（在宿主机执行其一）：\n"
+            f"    sudo chown -R {uid}:{gid} ./data ./backups\n"
+            '    或在 compose 中为该服务指定 user: "root"'
+        )
 
     init_db()
     check_database()

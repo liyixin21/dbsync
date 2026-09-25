@@ -21,7 +21,13 @@ def _sqlite_path(url: str) -> str | None:
 
 
 def ensure_directories() -> None:
-    """确保数据目录与备份目录存在。"""
+    """
+    确保数据目录与备份目录存在。
+
+    注意：makedirs 只会创建目录，不代表当前用户有写权限。
+    挂载卷场景下宿主机目录属主常与容器内 UID 不同，
+    真正的可写性由 check_writable_paths 在启动期校验。
+    """
     db_path = _sqlite_path(settings.DATABASE_URL)
     if db_path:
         parent = os.path.dirname(os.path.abspath(db_path))
@@ -31,6 +37,33 @@ def ensure_directories() -> None:
     log_dir = os.path.dirname(os.path.abspath(settings.LOG_FILE))
     if log_dir:
         os.makedirs(log_dir, exist_ok=True)
+
+
+def check_writable_paths() -> list:
+    """
+    校验关键路径可写性，返回不可写路径的列表。
+
+    在启动早期调用，把权限问题连同修复命令一起提示给用户，
+    避免运行到中途才出现难以定位的写入失败。
+    """
+    targets = []
+
+    db_path = _sqlite_path(settings.DATABASE_URL)
+    if db_path:
+        targets.append(("数据库目录", os.path.dirname(os.path.abspath(db_path))))
+    targets.append(("备份目录", os.path.abspath(settings.BACKUP_DIR)))
+
+    unwritable = []
+    for label, path in targets:
+        try:
+            os.makedirs(path, exist_ok=True)
+            probe = os.path.join(path, ".write-probe")
+            with open(probe, "w") as fh:
+                fh.write("")
+            os.unlink(probe)
+        except OSError as exc:
+            unwritable.append((label, path, str(exc)))
+    return unwritable
 
 
 ensure_directories()

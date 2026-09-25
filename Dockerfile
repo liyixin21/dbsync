@@ -43,10 +43,11 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
 RUN sed -i 's/deb.debian.org/mirrors.aliyun.com/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true
 
-# 只装运行时依赖：MySQL 客户端工具 + 健康检查用的 curl
+# 只装运行时依赖：MySQL 客户端工具 + 健康检查用的 curl + 降权工具 gosu
 RUN apt-get update && apt-get install -y --no-install-recommends \
     default-mysql-client \
     curl \
+    gosu \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=backend /install /usr/local
@@ -55,20 +56,26 @@ WORKDIR /app
 
 COPY app/ ./app/
 COPY run.py ./
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 # 前端构建产物（node 层在最终镜像中被丢弃）
 COPY --from=frontend /app/static/dist ./app/static/dist
 
-RUN mkdir -p /app/data /app/backups
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh && \
+    mkdir -p /app/data /app/backups
 
-# 以非 root 用户运行
+# 创建非 root 用户并移交 /app 所有权。
+#
+# 注意：这里不写 USER dbsync —— 入口脚本需要以 root 启动，
+# 以便修正挂载目录属主后再降权执行服务。
+# 服务进程本身仍以 dbsync 身份运行（见 docker-entrypoint.sh）。
 RUN useradd --create-home --shell /bin/bash dbsync && \
     chown -R dbsync:dbsync /app
-USER dbsync
 
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD curl -fsS http://localhost:8000/health || exit 1
 
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["python", "run.py"]
