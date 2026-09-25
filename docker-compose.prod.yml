@@ -1,0 +1,34 @@
+# 生产部署编排：使用已发布的镜像，无需源码构建。
+#
+#   docker compose -f docker-compose.prod.yml up -d
+#
+# 与 docker-compose.yml 的区别：
+#   - 本文件用 image: 拉取现成镜像，适合生产机部署
+#   - docker-compose.yml 用 build: 从源码构建，适合本地开发
+services:
+  dbsync:
+    image: liyixin21/dbsync:latest
+    container_name: dbsync
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+      - ./backups:/app/backups
+      - /etc/localtime:/etc/localtime:ro
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8000
+      - DEBUG=false
+      # 必须设置。缺失或过短时服务会拒绝启动（避免用弱密钥加密凭据）。
+      # 生成: python -c "import secrets; print(secrets.token_urlsafe(32))"
+      - SECRET_KEY=${SECRET_KEY:?SECRET_KEY 必须设置，生成方式: python -c "import secrets; print(secrets.token_urlsafe(32))"}
+      - BACKUP_DIR=/app/backups
+      - LOG_LEVEL=INFO
+      - TZ=Asia/Shanghai
+    restart: unless-stopped
+    networks:
+      - dbsync-net
+
+networks:
+  dbsync-net:
+    driver: bridge
