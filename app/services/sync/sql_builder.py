@@ -12,6 +12,8 @@
 3. 无主键表退化为全列定位，并显式上报，由调用方记录告警。
 """
 from dataclasses import dataclass, field
+from datetime import datetime
+from decimal import Decimal
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
@@ -51,6 +53,15 @@ class TableMeta:
     def writable_columns(self, keys: Sequence[str]) -> List[str]:
         """过滤出可显式赋值的列（排除生成列）。"""
         return [k for k in keys if k not in self.generated_columns]
+
+
+class NoChangeDetected(Exception):
+    """
+    UPDATE 事件的 before/after 完全一致，无需更新。
+
+    这不是错误：binlog 中确实存在把某列更新为相同值的事件，
+    或整行被重复写入。调用方应当跳过这一行，而不是记入失败队列。
+    """
 
 
 @dataclass
@@ -142,6 +153,89 @@ def _first(columns: Sequence[str]) -> str:
 
 # ------------------------------------------------------------------ UPDATE
 
+def _changed_columns(before: Dict[str, Any], after: Dict[str, Any]) -> List[str]:
+    """
+    找出值真正发生变化的列。
+
+    背景：binlog_row_image=FULL 时，UPDATE 事件的 before/after 都携带**整行**，
+    未修改的列在两侧值相同。若把 after 的全部列都写进 SET，会把未修改的
+    NOT NULL 列覆盖成 NULL（before 中为 None 的列），触发
+    1048 Column 'x' cannot be null —— 而该列其实根本没被改动。
+
+    因此只保留两侧值不同的列。双侧都为 None 视为未变化。
+
+    若对比不出差异（例如上传的行像缺失），退化为使用 after 的全部列，
+    由调用方按原有路径处理。
+    """
+    if not before:
+        return list(after.keys())
+
+    changed: List[str] = []
+    for column, new_value in after.items():
+        if column not in before:
+            # before 中没有该列，无从比较，保守地纳入
+            changed.append(column)
+            continue
+        old_value = before[column]
+        if _values_differ(old_value, new_value):
+            changed.append(column)
+    return changed
+
+
+def _values_differ(old_value: Any, new_value: Any) -> bool:
+    """
+    比较两个列值是否不同。
+
+    数值类型可能因驱动返回 int 与 Decimal 的不同表示，
+    直接 == 会误判为「已变化」，因此做一次规范化后再比。
+    """
+    if old_value is new_value:
+        return False
+    if old_value is None or new_value is None:
+        return old_value is not new_value
+
+    # 字节与字符串的等价比较（驱动差异）
+    if isinstance(old_value, (bytes, bytearray)) and isinstance(new_value, str):
+        try:
+            old_value = bytes(old_value).decode("utf-8", errors="replace")
+        except Exception:
+            pass
+    elif isinstance(new_value, (bytes, bytearray)) and isinstance(old_value, str):
+        try:
+            new_value = bytes(new_value).decode("utf-8", errors="replace")
+        except Exception:
+            pass
+
+    if old_value == new_value:
+        return False
+
+    # 数值类：Decimal(1) 与 int(1) 应视为相同
+    try:
+        if isinstance(old_value, (int, float, Decimal)) and isinstance(
+            new_value, (int, float, Decimal)
+        ):
+            return Decimal(str(old_value)) != Decimal(str(new_value))
+    except Exception:
+        pass
+
+    # 时间类：datetime 与字符串可能指向同一时刻
+    if isinstance(old_value, datetime) or isinstance(new_value, datetime):
+        try:
+            return _to_datetime(old_value) != _to_datetime(new_value)
+        except Exception:
+            return True
+
+    return str(old_value) != str(new_value)
+
+
+def _to_datetime(value: Any) -> Any:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
+    return value
+
+
 def build_update(meta: TableMeta, before: Dict[str, Any], after: Dict[str, Any]) -> GeneratedSQL:
     """
     构造 UPDATE：以行定位键匹配旧值，设置新值。
@@ -152,7 +246,17 @@ def build_update(meta: TableMeta, before: Dict[str, Any], after: Dict[str, Any])
     if not after:
         raise ValueError("更新后数据为空，拒绝生成 UPDATE")
 
-    set_columns = meta.writable_columns(list(after.keys()))
+    # 只更新真正变化的列：把未修改的列一并写进 SET，
+    # 会把 NOT NULL 列覆盖成 NULL 而报 1048。
+    candidates = _changed_columns(before, after)
+    if not candidates:
+        # 两侧完全一致，说明这行实际没有变化。
+        # 用专用异常表达，避免被上层当作数据处理失败记入 DLQ。
+        raise NoChangeDetected(
+            f"{meta.qualified_name} 的 UPDATE 事件未包含任何值变化"
+        )
+
+    set_columns = meta.writable_columns(candidates)
     if not set_columns:
         raise ValueError(f"{meta.qualified_name} 无可更新列")
 

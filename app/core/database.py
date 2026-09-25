@@ -8,7 +8,7 @@ import os
 from contextlib import contextmanager
 from typing import Generator, Iterator
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
 from .config import settings
@@ -70,12 +70,53 @@ ensure_directories()
 
 _is_sqlite = settings.DATABASE_URL.startswith("sqlite")
 
+
+def _sqlite_connect_args() -> dict:
+    """
+    SQLite 连接参数。
+
+    timeout：写锁等待时长。默认 5 秒在高频写入下不够——同步引擎持续写表状态
+    与位点，同时 API 还在响应请求，实测会出现
+    「database is locked」并导致接口 500。
+
+    配合下面的 WAL 模式，读写可以并发，写写仍会串行，因此需要足够长的等待。
+    """
+    return {
+        "check_same_thread": False,
+        "timeout": 30.0,
+    }
+
+
 engine = create_engine(
     settings.DATABASE_URL,
-    connect_args={"check_same_thread": False} if _is_sqlite else {},
+    connect_args=_sqlite_connect_args() if _is_sqlite else {},
     pool_pre_ping=True,
     echo=False,
 )
+
+
+@event.listens_for(engine, "connect")
+def _apply_sqlite_pragmas(dbapi_connection, connection_record):
+    """
+    SQLite 连接建立时应用的 PRAGMA。
+
+    - journal_mode=WAL：写操作不再阻塞读，显著降低并发场景下的
+      「database is locked」。同步引擎持续写位点/表状态时尤其关键。
+    - synchronous=NORMAL：WAL 下的推荐值，兼顾安全与性能。
+    - busy_timeout：与 connect timeout 对应的 SQLite 层等待。
+    """
+    if not _is_sqlite:
+        return
+    try:
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.close()
+    except Exception:
+        # PRAGMA 失败不应阻断连接，退回到默认行为
+        pass
+
 
 # expire_on_commit=False：路由函数普遍在 commit 后读取对象属性，
 # 关闭过期可使对象在会话关闭后仍可安全访问。

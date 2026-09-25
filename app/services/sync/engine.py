@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, List, Optional
 import mysql.connector
 import pymysql
 from loguru import logger
+from sqlalchemy.exc import IntegrityError
 
 from ...core.config import now_beijing, settings
 from ...core.database import session_scope
@@ -742,7 +743,23 @@ class SyncEngine:
                         task_id=self.task_id, schema_name=schema, table_name=table
                     )
                     db.add(row)
-                    db.flush()
+                    try:
+                        db.flush()
+                    except IntegrityError:
+                        # 并发场景下另一处已插入同一行（任务的表状态可能被
+                        # 消费线程与重放接口同时更新）。回滚本次插入后重新查询。
+                        db.rollback()
+                        row = (
+                            db.query(SyncTableState)
+                            .filter(
+                                SyncTableState.task_id == self.task_id,
+                                SyncTableState.schema_name == schema,
+                                SyncTableState.table_name == table,
+                            )
+                            .first()
+                        )
+                        if row is None:
+                            raise
 
                 try:
                     new_state = TableSyncState(state)

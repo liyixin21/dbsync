@@ -16,7 +16,13 @@ from loguru import logger
 
 from . import errors as err_mod
 from .errors import ErrorClass
-from .sql_builder import TableMeta, build_delete, build_insert, build_update
+from .sql_builder import (
+    NoChangeDetected,
+    TableMeta,
+    build_delete,
+    build_insert,
+    build_update,
+)
 
 
 def _stringify(values: Dict[Any, Any]) -> Dict[str, Any]:
@@ -331,6 +337,10 @@ class Applier:
 
         try:
             generated = self._build(meta, event_type, row, after)
+        except NoChangeDetected:
+            # 行值未发生实际变化，属于正常情况，静默跳过
+            logger.debug(f"任务 {self.task_id} {schema}.{table} 无值变化，已跳过")
+            return False
         except ValueError as exc:
             # 构造 SQL 失败属于数据处理问题：记 DLQ，跳过该行但继续推进位点
             if self._record_failure(
