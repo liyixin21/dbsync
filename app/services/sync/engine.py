@@ -11,6 +11,7 @@ binlog 消费引擎。
 """
 import json
 import random
+import socket
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
@@ -255,25 +256,79 @@ class SyncEngine:
         return self._running.is_set() and not self._stop_event.is_set()
 
     def start(self) -> None:
-        """启动消费线程（非 daemon，保证优雅停机）。"""
+        """
+        启动消费线程。
+
+        用 daemon 线程：停机时会先尝试优雅停止（位点落盘），
+        若因网络阻塞未能及时退出，也不应拖着整个进程不结束。
+        """
         if self._thread is not None and self._thread.is_alive():
             logger.warning(f"同步任务 {self.task_id} 已在运行")
             return
         self._stop_event.clear()
         self._thread = threading.Thread(
-            target=self._run_guarded, name=f"sync-{self.task_id}", daemon=False
+            target=self._run_guarded, name=f"sync-{self.task_id}", daemon=True
         )
         self._thread.start()
 
     def stop(self, timeout: float = 30.0) -> None:
-        """请求停止并等待线程收尾（含位点落盘）。"""
+        """
+        请求停止并等待线程收尾（含位点落盘）。
+
+        关键：仅设置停止标志是不够的——消费线程通常阻塞在网络读取上
+        （等待 binlog 事件），标志要等到下一个事件到达才会被检查。
+        因此这里主动关闭 binlog 流连接，让阻塞读取立即抛错返回，
+        线程才能走到停机逻辑完成位点落盘。
+        """
         self._stop_event.set()
+
+        # 打断阻塞中的流读取
+        self._interrupt_stream()
+
         thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=timeout)
             if thread.is_alive():
-                logger.error(f"同步任务 {self.task_id} 未能在 {timeout}s 内停止")
+                # 兜底：再关一次并在日志中明确告警。
+                # 线程是 daemon，不会阻止进程退出。
+                logger.error(
+                    f"同步任务 {self.task_id} 未能在 {timeout}s 内停止，"
+                    "位点可能未落盘（下次启动会从上次保存的位置重放）"
+                )
+                self._interrupt_stream()
         self._running.clear()
+
+    def _interrupt_stream(self) -> None:
+        """
+        关闭底层流连接，打断阻塞读取。
+
+        pymysqlreplication 在 _read_packet() 上无超时地等待数据，
+        socket 关闭会让它立刻抛出异常，从而脱离阻塞。
+        异常会被消费循环捕获并进入正常的停机路径。
+        """
+        stream = self._stream
+        if stream is None:
+            return
+        try:
+            # 先关底层 socket：close() 本身在阻塞读取中可能等待
+            conn = getattr(stream, "_stream_connection", None)
+            if conn is not None:
+                sock = getattr(conn, "_sock", None) or getattr(conn, "socket", None)
+                if sock is not None:
+                    try:
+                        sock.shutdown(socket.SHUT_RDWR)
+                    except Exception:
+                        pass
+                    try:
+                        sock.close()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        try:
+            stream.close()
+        except Exception:
+            pass
 
     def join(self, timeout: Optional[float] = None) -> None:
         if self._thread is not None:
@@ -432,44 +487,70 @@ class SyncEngine:
         事件消费循环。
 
         与连接建立分离，便于在无真实 MySQL 的环境下验证事件分发逻辑。
+
+        停机时底层流连接会被主动关闭（见 _interrupt_stream），
+        阻塞中的读取随即抛错。那种情况属于预期停机，不作为异常上报。
         """
-        for event in stream:
-            if self._stop_event.is_set():
-                raise SyncAborted()
+        try:
+            iterator = iter(stream)
+            while True:
+                if self._stop_event.is_set():
+                    raise SyncAborted()
 
-            if isinstance(event, RotateEvent):
-                # 每次建立 binlog 流时，源库都会先发一个 Rotate 事件告知当前文件。
-                # 若该事件指向的正是我们正在消费的文件，偏移量必须保持不变——
-                # 否则位点会被重置到 4，整份 binlog 从头重放。
-                # 只有真正轮转到新文件时才从头部开始。
-                current = checkpoint.position
-                if event.next_binlog != current.binlog_file:
-                    checkpoint.update_position(
-                        binlog_file=event.next_binlog, binlog_pos=4
-                    )
-                else:
-                    checkpoint.update_position(binlog_file=event.next_binlog)
-                continue
+                try:
+                    event = next(iterator)
+                except StopIteration:
+                    return
+                except SyncAborted:
+                    raise
+                except Exception:
+                    # 流已被 stop() 关闭 → 正常停机路径
+                    if self._stop_event.is_set():
+                        raise SyncAborted() from None
+                    raise
 
-            if isinstance(event, XidEvent):
-                # 事务提交边界：目标库在此刻原子落地
-                stats = self._applier.commit()
-                if stats.total or stats.failed:
-                    checkpoint.record_events(stats.total)
-                    checkpoint.record_dlq(stats.failed)
-                    checkpoint.update_position(
-                        binlog_file=checkpoint.position.binlog_file,
-                        binlog_pos=self._event_pos(event),
-                    )
-                checkpoint.maybe_flush()
-                self._maybe_mark_stalled(checkpoint)
-                continue
+                if self._stop_event.is_set():
+                    raise SyncAborted()
 
-            if isinstance(event, QueryEvent):
-                self._handle_query_event(event, checkpoint)
-                continue
+                self._dispatch(event, checkpoint)
+        except SyncAborted:
+            raise
 
-            self._handle_row_event(event, checkpoint)
+    def _dispatch(self, event, checkpoint: CheckpointStore) -> None:
+        """按事件类型分派。"""
+        if isinstance(event, RotateEvent):
+            # 每次建立 binlog 流时，源库都会先发一个 Rotate 事件告知当前文件。
+            # 若该事件指向的正是我们正在消费的文件，偏移量必须保持不变——
+            # 否则位点会被重置到 4，整份 binlog 从头重放。
+            # 只有真正轮转到新文件时才从头部开始。
+            current = checkpoint.position
+            if event.next_binlog != current.binlog_file:
+                checkpoint.update_position(
+                    binlog_file=event.next_binlog, binlog_pos=4
+                )
+            else:
+                checkpoint.update_position(binlog_file=event.next_binlog)
+            return
+
+        if isinstance(event, XidEvent):
+            # 事务提交边界：目标库在此刻原子落地
+            stats = self._applier.commit()
+            if stats.total or stats.failed:
+                checkpoint.record_events(stats.total)
+                checkpoint.record_dlq(stats.failed)
+                checkpoint.update_position(
+                    binlog_file=checkpoint.position.binlog_file,
+                    binlog_pos=self._event_pos(event),
+                )
+            checkpoint.maybe_flush()
+            self._maybe_mark_stalled(checkpoint)
+            return
+
+        if isinstance(event, QueryEvent):
+            self._handle_query_event(event, checkpoint)
+            return
+
+        self._handle_row_event(event, checkpoint)
 
     # ------------------------------------------------------------ 事件处理
 

@@ -1503,3 +1503,154 @@ class TestNoPrimaryKeyReporting:
         )
         assert row.last_error is None, "恢复后错误信息未清除"
         assert row.state.value == "active"
+
+
+class TestGracefulShutdown:
+    """
+    停机必须真正生效。
+
+    真实环境暴露的问题：消费线程阻塞在网络读取上（等待 binlog 事件）时，
+    _stop_event 要等下一个事件到达才会被检查。没有数据变更的库会一直等，
+    stop() 超时后线程仍存活，导致进程无法退出——只能 kill -9。
+
+    修复要点：
+    1. 主动关闭底层流连接，让阻塞读取立即抛错
+    2. 线程改为 daemon，即使意外卡住也不拖住进程
+    """
+
+    def test_stop_interrupts_blocking_stream(self, task):
+        """
+        核心：流一直阻塞（无事件）时，stop() 必须能返回。
+        """
+        import threading as _threading
+        import time as _time
+
+        class BlockingStream:
+            """模拟阻塞在网络上等待 binlog 事件的流。"""
+
+            def __init__(self):
+                self.unblocked = _threading.Event()
+                self.closed = False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                # 一直阻塞，直到被关闭打断
+                self.unblocked.wait()
+                raise RuntimeError("stream closed")
+
+            def close(self):
+                self.closed = True
+                self.unblocked.set()
+
+        class BlockingReader(FakeReader):
+            def __init__(self, stream):
+                super().__init__(events=[])
+                self._stream = stream
+
+            def stream(self, **kwargs):
+                return self._stream
+
+        block = BlockingStream()
+        conn = FakeTargetConnection()
+        engine = make_engine(BlockingReader(block), conn)
+        engine._schema = StubSchemaResolver()
+
+        engine.start()
+        _time.sleep(0.5)   # 让线程进入阻塞
+
+        started = _time.time()
+        engine.stop(timeout=15)
+        elapsed = _time.time() - started
+
+        assert not engine.is_running, "任务仍在运行"
+        assert elapsed < 15, f"停机耗时过长: {elapsed:.1f}s"
+        assert block.closed, "未关闭底层流，阻塞读取无法被打断"
+
+    def test_thread_is_daemon(self, task):
+        """消费线程必须是 daemon：意外卡住时不应阻止进程退出。"""
+        reader = FakeReader(events=[])
+        engine = make_engine(reader, FakeTargetConnection())
+
+        engine.start()
+        try:
+            assert engine._thread is not None
+            assert engine._thread.daemon is True, "非 daemon 线程会拖住进程退出"
+        finally:
+            engine.stop(timeout=10)
+
+    def test_stop_returns_quickly_when_idle(self, task):
+        """空闲状态下停机应当很快。"""
+        import time as _time
+
+        class SlowStream:
+            def __init__(self):
+                self._stop = False
+                self.closed = False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                import time as _t
+                for _ in range(100):
+                    if self._stop:
+                        raise RuntimeError("closed")
+                    _t.sleep(0.05)
+                raise RuntimeError("closed")
+
+            def close(self):
+                self._stop = True
+                self.closed = True
+
+        class SlowReader(FakeReader):
+            def __init__(self, stream):
+                super().__init__(events=[])
+                self._stream = stream
+
+            def stream(self, **kwargs):
+                return self._stream
+
+        stream = SlowStream()
+        engine = make_engine(SlowReader(stream), FakeTargetConnection())
+        engine._schema = StubSchemaResolver()
+
+        engine.start()
+        _time.sleep(0.4)
+
+        started = _time.time()
+        engine.stop(timeout=15)
+        elapsed = _time.time() - started
+
+        assert elapsed < 15, f"停机耗时 {elapsed:.1f}s"
+        assert stream.closed
+
+    def test_interrupt_on_missing_stream_is_safe(self, task):
+        """未建立流时调用中断不应抛异常。"""
+        engine = make_engine(FakeReader(events=[]), FakeTargetConnection())
+        engine._interrupt_stream()   # 不应抛异常
+
+    def test_interrupt_tolerates_broken_stream(self, task):
+        """底层对象结构异常时，中断逻辑必须静默容错。"""
+        engine = make_engine(FakeReader(events=[]), FakeTargetConnection())
+
+        class BrokenStream:
+            def close(self):
+                raise RuntimeError("close failed")
+
+            @property
+            def _stream_connection(self):
+                raise RuntimeError("attribute error")
+
+        engine._stream = BrokenStream()
+        engine._interrupt_stream()   # 不应抛异常
+
+    def test_stop_is_idempotent(self, task):
+        """重复调用 stop 不应出错。"""
+        engine = make_engine(FakeReader(events=[]), FakeTargetConnection())
+        engine.start()
+        engine.stop(timeout=10)
+        engine.stop(timeout=10)
+        engine.stop(timeout=10)
+        assert not engine.is_running

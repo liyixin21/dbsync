@@ -1,0 +1,51 @@
+# 构建上下文排除清单。
+#
+# 关键：.env 含 SECRET_KEY，绝不能进入构建上下文
+#（即便 Dockerfile 不 COPY 它，内容也会被发送给 docker daemon）。
+# 排除后同时能大幅缩小上下文体积、加快构建。
+
+# 环境与密钥
+.env
+.env.*
+!.env.example
+
+# 本地运行数据
+data/
+backups/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# 前端依赖与产物（镜像内会重新构建）
+frontend/node_modules/
+frontend/dist/
+app/static/dist/
+
+# 版本控制与编辑器
+.git/
+.gitignore
+.vscode/
+.idea/
+*.swp
+
+# 文档（镜像内不需要）
+README.md
+REFACTOR_PLAN.md
+
+# 未使用的编排文件
+docker-compose*.yml
+
+# 测试（镜像内不需要）
+tests/
+
+# 系统文件
+.DS_Store
+Thumbs.db
+*.log
