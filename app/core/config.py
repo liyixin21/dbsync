@@ -86,19 +86,55 @@ class Settings(BaseSettings):
         return key in INSECURE_SECRETS or len(key) < 16
 
     def validate_for_startup(self) -> None:
-        """启动期校验。生产模式下配置不安全直接拒绝启动。"""
+        """
+        启动期校验：生产模式下 SECRET_KEY 不安全则拒绝启动。
+
+        刻意采用「拒绝启动」而不是「仅告警」：
+        SECRET_KEY 用于加密数据库密码与 OpenList 密码，
+        沿用公开的占位值等于把凭据以众所周知的密钥加密，而这类问题
+        一旦只在日志里告警就基本没人会注意到。
+
+        提示会先于 traceback 打印，避免用户被栈信息挡住真正的原因。
+        """
         if not self.is_insecure_secret:
             return
-        hint = (
-            "请在 .env 或环境变量中设置 SECRET_KEY。"
-            '生成方式: python -c "import secrets; print(secrets.token_urlsafe(32))"'
-        )
+
+        generate_cmd = 'python -c "import secrets; print(secrets.token_urlsafe(32))"'
+        hint = f"生成方式：{generate_cmd}"
+
         if self.DEBUG:
-            print(f"[WARNING] SECRET_KEY 未设置或强度不足，{hint}", file=sys.stderr)
+            print(f"[WARNING] SECRET_KEY 未设置或强度不足。{hint}", file=sys.stderr)
             return
+
+        # 先打印可读提示，再抛异常——用户第一眼看到的就是解决办法
+        banner = (
+            "\n"
+            + "=" * 68
+            + "\n  启动失败：SECRET_KEY 未设置或强度不足\n"
+            + "=" * 68
+            + "\n\n"
+            + "  这个密钥用于加密数据库密码与 OpenList 密码，\n"
+            + "  使用默认占位值会让这些凭据形同明文存储。\n"
+            + "\n"
+            + "  解决办法（任选其一）：\n"
+            + "\n"
+            + f"    1) 生成一个随机密钥：\n        {generate_cmd}\n"
+            + "\n"
+            + "    2) 在 docker-compose.yml 中把该密钥填到：\n"
+            + "         - SECRET_KEY=你生成的密钥\n"
+            + "\n"
+            + "    3) 或通过环境变量启动：\n"
+            + "         export SECRET_KEY=你生成的密钥\n"
+            + "\n"
+            + "  注意：密钥设定后请勿再更改，否则已保存的密码将无法解密。\n"
+            + "  （仅本地开发可设 DEBUG=true 跳过此校验）\n"
+            + "=" * 68
+            + "\n"
+        )
+        print(banner, file=sys.stderr)
+
         raise RuntimeError(
-            f"配置校验失败：SECRET_KEY 未设置或强度不足。{hint}\n"
-            "（如需以开发模式启动，请设置 DEBUG=true）"
+            "SECRET_KEY 未设置或强度不足，服务拒绝启动（详见上方提示）"
         )
 
 

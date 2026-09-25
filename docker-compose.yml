@@ -13,10 +13,10 @@ services:
       - HOST=0.0.0.0
       - PORT=8000
       - DEBUG=false
-      # SECRET_KEY 通过宿主机环境变量注入，不写死在文件里。
-      # 未设置时 compose 会直接报错拒绝启动，避免用弱密钥加密凭据。
+      # 请把下面的值改成你自己的随机密钥后再启动，否则容器会拒绝启动并提示。
       # 生成方式：python -c "import secrets; print(secrets.token_urlsafe(32))"
-      - SECRET_KEY=${SECRET_KEY:?SECRET_KEY 未设置，请先生成并导出}
+      # 密钥用于加密数据库密码，设定后请勿更改，否则已保存的密码将无法解密。
+      - SECRET_KEY=change-this-to-a-random-secret-key
       - BACKUP_DIR=/app/backups
       - LOG_LEVEL=INFO
       - TZ=Asia/Shanghai
