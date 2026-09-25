@@ -26,6 +26,9 @@ frontend/dist/
 # 日志
 *.log
 
+# 测试（包含硬编码测试数据，不上传）
+tests/
+
 # 测试与缓存
 .pytest_cache/
 .coverage
