@@ -23,6 +23,7 @@ from ..core.errors import (
 )
 from ..models.database import BackupPlan, Database, DatabaseType, SyncTask, User
 from ..services.audit import log_operation
+from ..services.mysql.conninfo import build_connect_kwargs, connect_plain_fallback
 from .deps import client_ip, get_current_user
 
 router = APIRouter()
@@ -161,15 +162,15 @@ async def test_connection(
     password = _resolve_stored_password(payload, db)
 
     try:
-        conn = mysql.connector.connect(
-            host=payload.host,
-            port=payload.port,
-            user=payload.username,
-            password=password,
-            database=payload.database_name,
-            connection_timeout=8,
-            connect_timeout=8,
-            ssl_disabled=True,
+        conn = connect_plain_fallback(
+            **build_connect_kwargs(
+                host=payload.host,
+                port=payload.port,
+                user=payload.username,
+                password=password,
+                database=payload.database_name or None,
+                connect_timeout=8,
+            )
         )
     except mysql.connector.Error as exc:
         return TestConnectionResponse(success=False, message=f"连接失败: {_compact(exc)}")

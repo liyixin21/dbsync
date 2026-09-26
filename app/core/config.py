@@ -71,6 +71,17 @@ class Settings(BaseSettings):
     SYNC_CHECKPOINT_INTERVAL: float = 2.0  # 位点落盘间隔（秒）
     SYNC_RETRY_BASE_DELAY: float = 2.0
     SYNC_RETRY_MAX_DELAY: float = 60.0
+    # binlog 心跳间隔（秒）。源库对空闲从库连接会按 wait_timeout 掐断，
+    # 默认 8.0 为 8 小时、云数据库常配 30~60 秒，一旦掐断就会走库的重连路径。
+    # 保持心跳可避免这种无谓断连。必须小于源库 wait_timeout 的一半。
+    SYNC_HEARTBEAT_SECONDS: float = 15.0
+    # 同步线程意外死亡后的自动重启上限（次）与退避基准（秒）。
+    # 设为 0 可关闭自愈。库缺陷、连接抖动等都可能打死线程，
+    # 没有自愈就只能靠人工发现——夜间无人值守时等于数据停更。
+    # 重试始终从最后已提交位点开始，且写入是幂等的，重复应用无副作用；
+    # 上限用尽后任务置为 failed，不会无限重启。
+    SYNC_AUTO_RECOVER_MAX: int = 5
+    SYNC_AUTO_RECOVER_DELAY: float = 10.0
     SYNC_SERVER_ID_BASE: int = 10000
     SYNC_SERVER_ID_RANGE: int = 50000
     DLQ_MAX_ROWS: int = 100000             # 失败事件队列上限

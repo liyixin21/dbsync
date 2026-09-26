@@ -16,7 +16,11 @@ cryptography==41.0.7
 # MySQL 同步与备份
 mysql-connector-python==8.2.0
 pymysql==1.1.0
-mysql-replication==1.0.5
+# 必须 >=1.0.7：1.0.5/1.0.6 的 binlogstream.py 会调用 logging.WARN(...)，
+# 该符号在 Python 3 是整数常量 30，一旦源库掐断空闲连接（OperationalError
+# 2006/2013，库本该自动重连的正常路径）就抛 TypeError，直接打死同步线程。
+# 启动期有版本守卫兜底（见 app/services/sync/engine.py 的 _assert_reader_lib_sane）。
+mysql-replication==1.0.17
 
 # OpenList 备份上传（运行时依赖）+ 测试客户端
 httpx==0.25.2

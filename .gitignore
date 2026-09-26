@@ -29,6 +29,9 @@ frontend/dist/
 # 测试（包含硬编码测试数据，不上传）
 tests/
 
+# 验证脚本（含本地验证环境的硬编码参数，与 tests/ 同性质）
+scripts/
+
 # 测试与缓存
 .pytest_cache/
 .coverage

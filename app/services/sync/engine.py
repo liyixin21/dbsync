@@ -24,6 +24,7 @@ from sqlalchemy.exc import IntegrityError
 from ...core.config import now_beijing, settings
 from ...core.database import session_scope
 from ...models.database import SyncError, SyncStatus, SyncTableState, TableSyncState
+from ..mysql.conninfo import build_connect_kwargs, connect_plain_fallback
 from ..mysql.schema import SchemaResolver
 from . import errors as err_mod
 from .applier import Applier, FailedEvent, TransientConnectionError
@@ -42,6 +43,69 @@ except ImportError as exc:  # pragma: no cover
     raise ImportError("缺少 mysql-replication 依赖，无法启动同步引擎") from exc
 
 _DDL_PREFIXES = ("CREATE", "ALTER", "DROP", "RENAME", "TRUNCATE")
+
+# MySQL 字段类型码，用于识别需要补齐定义的 ENUM/SET 列。
+# 取自 pymysql.constants.FIELD_TYPE，写死数值以免依赖其内部结构。
+_ENUM_TYPE = 247   # FIELD_TYPE.ENUM
+_SET_TYPE = 248    # FIELD_TYPE.SET
+
+# mysql-replication 1.0.5/1.0.6 的 fetchone() 里写了 logging.WARN(...)，
+# 这在 Python 3 是 int 常量（30）而非函数。该分支本意是处理「连接被源库掐断」，
+# 属于库自身会自动重连的**正常路径**，但一旦走到这里就抛
+# TypeError: 'int' object is not callable，把同步线程直接打死。
+# 1.0.7 起修复。此处做启动期硬校验：宁可在启动时就报错，也不要半夜里静默掉线。
+_MIN_READER_LIB_VERSION = (1, 0, 7)
+
+
+def _reader_lib_version() -> Optional[tuple]:
+    """取 mysql-replication 的已安装版本，取不到返回 None。"""
+    try:
+        from importlib.metadata import version as _pkg_version
+
+        raw = _pkg_version("mysql-replication")
+    except Exception:
+        return None
+    parts: List[int] = []
+    for chunk in str(raw).split("."):
+        digits = "".join(ch for ch in chunk if ch.isdigit())
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts) if parts else None
+
+
+def assert_reader_lib_sane() -> None:
+    """
+    启动期校验 binlog 读取库版本。
+
+    版本过低时库会在「连接被掐断」这一正常路径上崩溃，且崩溃点在线程内部，
+    外部只能看到任务莫名失败。提前拒绝启动能让问题在部署阶段就暴露。
+    """
+    installed = _reader_lib_version()
+    if installed is None:
+        # 元数据缺失（如源码直跑）：退化为运行时探测，直接看源码里有没有这个 bug。
+        try:
+            import inspect
+
+            src = inspect.getsource(BinLogStreamReader.fetchone)
+        except Exception:
+            return
+        if "logging.WARN(" in src:
+            raise SyncConfigError(
+                "mysql-replication 版本过低（存在 logging.WARN 调用缺陷），"
+                "会在源库断开空闲连接时崩溃。请升级：pip install -U mysql-replication"
+            )
+        return
+
+    if installed < _MIN_READER_LIB_VERSION:
+        want = ".".join(str(x) for x in _MIN_READER_LIB_VERSION)
+        got = ".".join(str(x) for x in installed)
+        raise SyncConfigError(
+            f"mysql-replication 版本过低（当前 {got}，需要 >= {want}）。"
+            "低版本在源库掐断空闲连接时调用 logging.WARN()——该符号在 Python 3 "
+            "是整数 30，会抛 TypeError 并终止同步线程。"
+            "修复：pip install -U 'mysql-replication>=1.0.7'"
+        )
 
 
 def _norm_schema(value: Any) -> str:
@@ -88,14 +152,13 @@ class BinlogReader:
         result: Dict[str, Optional[str]] = {
             "format": None, "row_image": None, "row_metadata": None, "gtid_mode": None,
         }
-        conn = mysql.connector.connect(
-            host=self._cfg["host"],
-            port=self._cfg["port"],
-            user=self._cfg["user"],
-            password=self._cfg["password"],
-            connect_timeout=10,
-            connection_timeout=10,
-            ssl_disabled=True,
+        conn = connect_plain_fallback(
+            **build_connect_kwargs(
+                host=self._cfg["host"],
+                port=self._cfg["port"],
+                user=self._cfg["user"],
+                password=self._cfg["password"],
+            )
         )
         try:
             cursor = conn.cursor()
@@ -131,14 +194,13 @@ class BinlogReader:
         Binlog_Do_DB, Binlog_Ignore_DB)。因此 GTID 只能在 gtid_mode 开启
         且列数足够时读取，否则留空——不能盲目取第 5 列。
         """
-        conn = mysql.connector.connect(
-            host=self._cfg["host"],
-            port=self._cfg["port"],
-            user=self._cfg["user"],
-            password=self._cfg["password"],
-            connect_timeout=10,
-            connection_timeout=10,
-            ssl_disabled=True,
+        conn = connect_plain_fallback(
+            **build_connect_kwargs(
+                host=self._cfg["host"],
+                port=self._cfg["port"],
+                user=self._cfg["user"],
+                password=self._cfg["password"],
+            )
         )
         try:
             cursor = conn.cursor()
@@ -193,6 +255,11 @@ class BinlogReader:
             only_schemas=[self._cfg["database"]],
             blocking=blocking,
             resume_stream=True,
+            # 心跳：源库空闲超过 wait_timeout 会单方面掐断连接（表现为
+            # OperationalError 2006/2013）。库虽有自动重连逻辑，但依赖
+            # 「断线后再报错」本身就要多绕一圈重连；主动心跳让连接保持活跃，
+            # 从源头上避免这个循环。取值需远小于源库 wait_timeout。
+            slave_heartbeat=settings.SYNC_HEARTBEAT_SECONDS,
         )
 
 
@@ -249,6 +316,18 @@ class SyncEngine:
         self._stream = None
         self._retry_delay = settings.SYNC_RETRY_BASE_DELAY
         self.last_error: Optional[str] = None
+        # 退出原因：stopped（正常停止）/ failed（异常崩溃）/ None（仍在运行）。
+        # 主管进程靠它区分「用户按了停止」和「线程自己死了」。
+        self._exit_reason: Optional[str] = None
+
+    @property
+    def exit_reason(self) -> Optional[str]:
+        return self._exit_reason
+
+    @property
+    def has_failed(self) -> bool:
+        """线程是否因异常退出（而非被正常停止）。"""
+        return self._exit_reason == "failed"
 
     # ------------------------------------------------------------ 生命周期
 
@@ -341,11 +420,16 @@ class SyncEngine:
         self._running.set()
         try:
             self._run()
+            self._exit_reason = "stopped"
         except SyncAborted:
             logger.info(f"同步任务 {self.task_id} 已停止")
+            self._exit_reason = "stopped"
         except Exception as exc:
             logger.exception(f"同步任务 {self.task_id} 异常退出: {exc}")
             self.last_error = str(exc)
+            # 记录崩溃事实：主管进程据此判定「线程死了但任务没被停止」，
+            # 从而触发自愈。旧实现只把状态写进库，人不去翻日志就永远发现不了。
+            self._exit_reason = "failed"
             if self._checkpoint is not None:
                 self._checkpoint.set_status(SyncStatus.FAILED, str(exc)[:1000])
                 self._checkpoint.set_health("stalled")
@@ -606,6 +690,53 @@ class SyncEngine:
         # 非 DDL 的 Query 事件 = statement 格式的 DML
         self._warn_statement_dml(query, checkpoint)
 
+    def _ensure_enum_labels(self, event, schema: str, table: str) -> None:
+        """
+        为缺定义的 ENUM/SET 列补齐候选值。
+
+        背景（真实缺陷）：源库 binlog_row_metadata=MINIMAL 时，MySQL 不下发
+        ENUM_STR_VALUE 元数据，pymysqlreplication 于是把这些列解码成 **None**：
+
+            elif column.type == FIELD_TYPE.ENUM:
+                if column.enum_values:                 # MINIMAL 下恒为假
+                    return column.enum_values[...]
+                self.packet.read_uint_by_size(...)     # 读掉字节
+                return None                            # ← 真实值被丢弃
+
+        后果是 NOT NULL 的 ENUM 列写入报 1048（Column cannot be null）、
+        可空 ENUM 列被静默写成 NULL。这与「UPDATE 误写未修改列」是同类数据
+        损坏，但触发条件更隐蔽：只在 MINIMAL 元数据下出现。
+
+        修法：从目标库的 information_schema 读出真实候选值，
+        按列序号回填到事件列定义上，让库按正常路径解码。
+        读取顺序即 ORDINAL_POSITION，与 binlog 中的列顺序一致。
+        """
+        columns = getattr(event, "columns", None)
+        if not columns:
+            return
+
+        # 快路径：全部列都无需补（表里没有 ENUM/SET，或库已自带定义）
+        if all(getattr(c, "enum_values", None) or getattr(c, "set_values", None)
+               or getattr(c, "type", None) not in (_ENUM_TYPE, _SET_TYPE)
+               for c in columns):
+            return
+
+        meta = self._schema.get(schema, table) if self._schema is not None else None
+        if meta is None:
+            return
+
+        for index, column in enumerate(columns):
+            ctype = getattr(column, "type", None)
+            if ctype == _ENUM_TYPE and not getattr(column, "enum_values", None):
+                labels = meta.enum_labels_at(index)
+                if labels:
+                    # 库里约定 enum_values[0] 为空串占位（下标 1 起才是真实值）
+                    column.enum_values = [""] + list(labels)
+            elif ctype == _SET_TYPE and not getattr(column, "set_values", None):
+                labels = meta.set_labels_at(index)
+                if labels:
+                    column.set_values = list(labels)
+
     def _warn_statement_dml(self, query: str, checkpoint: CheckpointStore) -> None:
         message = (
             f"检测到 statement 格式的 SQL 事件，源库 binlog_format 可能不是 ROW，"
@@ -634,6 +765,11 @@ class SyncEngine:
         schema = self.target_schema
         self._current_schema = schema
         self._current_table = table
+
+        # 必须在读取 event.rows 之前补齐 ENUM/SET 定义：
+        # rows 是惰性解码的（首次访问时才逐列解析）。一旦开始解码，
+        # 缺定义的 ENUM 列已经被读成 None，再补也来不及。
+        self._ensure_enum_labels(event, schema, table)
 
         pos = self._event_pos(event)
         ts = getattr(event, "timestamp", None)
@@ -818,19 +954,19 @@ class SyncEngine:
 
     def _connect_target(self):
         try:
-            self._target_conn = mysql.connector.connect(
-                host=self.target_config["host"],
-                port=self.target_config["port"],
-                user=self.target_config["user"],
-                password=self.target_config["password"],
-                # 必须指定默认库：源库的 DDL 往往不带库名限定符
-                # （如 ALTER TABLE users ADD COLUMN x），没有默认库会直接报
-                # "No database selected"，导致表结构变更无法同步。
-                database=self.target_schema or None,
-                connect_timeout=10,
-                connection_timeout=10,
-                ssl_disabled=True,
-                autocommit=False,
+            self._target_conn = connect_plain_fallback(
+                **build_connect_kwargs(
+                    host=self.target_config["host"],
+                    port=self.target_config["port"],
+                    user=self.target_config["user"],
+                    password=self.target_config["password"],
+                    # 必须指定默认库：源库的 DDL 往往不带库名限定符
+                    # （如 ALTER TABLE users ADD COLUMN x），没有默认库会直接报
+                    # "No database selected"，导致表结构变更无法同步。
+                    database=self.target_schema or None,
+                    # 同步写入依赖显式事务边界（XID 提交），不能自动提交
+                    autocommit=False,
+                )
             )
             logger.info(
                 f"任务 {self.task_id} 已连接目标库: "

@@ -27,6 +27,22 @@ class TableMeta:
     pk_columns: Tuple[str, ...] = ()              # 主键列
     unique_keys: Tuple[Tuple[str, ...], ...] = ()  # 唯一键（元组列表）
     generated_columns: frozenset = field(default_factory=frozenset)  # 不可显式赋值
+    # ENUM/SET 的候选值，键为列名。顺序即定义顺序，用于把 binlog 里的
+    # 数值下标还原为字面量（详见 enum_ordinal_to_label 的说明）。
+    enum_labels: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
+    set_labels: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
+
+    def enum_labels_at(self, index: int) -> Optional[Tuple[str, ...]]:
+        """按列序号取 ENUM 候选值。序号超出或该列不是 ENUM 时返回 None。"""
+        if 0 <= index < len(self.columns):
+            return self.enum_labels.get(self.columns[index])
+        return None
+
+    def set_labels_at(self, index: int) -> Optional[Tuple[str, ...]]:
+        """按列序号取 SET 候选值。"""
+        if 0 <= index < len(self.columns):
+            return self.set_labels.get(self.columns[index])
+        return None
 
     @property
     def qualified_name(self) -> str:

@@ -8,6 +8,7 @@
 """
 import asyncio
 import threading
+import time
 from typing import Dict, List, Optional
 
 from loguru import logger
@@ -25,8 +26,14 @@ from ...core.errors import (
 )
 from ...models.database import Database, SyncHealth, SyncStatus, SyncTask
 from ..audit import task_log
+from ..mysql.conninfo import build_connect_kwargs, connect_plain_fallback
 from .checkpoint import load_checkpoint
-from .engine import BinlogReader, SyncConfigError, SyncEngine
+from .engine import BinlogReader, SyncConfigError, SyncEngine, assert_reader_lib_sane
+
+# 任务稳定运行超过该时长后，崩溃计数归零。
+# 目的：区分「起来就崩的循环」与「跑了一天偶发崩一次」，
+# 后者不该被累计到上限而永久失去自愈。
+_RECOVER_RESET_AFTER = 600.0
 
 
 def _source_config(db: Database) -> dict:
@@ -65,6 +72,14 @@ class SyncManager:
         self._engines: Dict[int, SyncEngine] = {}
         self._lock = threading.RLock()
         self._running = False
+        # 自愈状态：任务崩溃后已重启的次数，以及本轮计数的起算时刻。
+        # 计数会在任务稳定运行一段时间后归零，避免「每天崩一次」累计到上限后
+        # 永久停止自愈；同时又能拦住「起来就崩」的快速崩溃循环。
+        self._recover_counts: Dict[int, int] = {}
+        self._recover_since: Dict[int, float] = {}
+        # 已排定但还没到退避时刻的重启（task_id → 截止的 monotonic 时刻）。
+        # 用截止时刻而非 sleep，避免在共享的健康循环里阻塞其他任务。
+        self._recover_pending: Dict[int, float] = {}
 
     # ------------------------------------------------------------ 查询
 
@@ -95,6 +110,9 @@ class SyncManager:
         with self._lock:
             engines = list(self._engines.values())
             self._engines.clear()
+        self._recover_counts.clear()
+        self._recover_since.clear()
+        self._recover_pending.clear()
 
         for engine in engines:
             try:
@@ -184,24 +202,30 @@ class SyncManager:
             return db.query(SyncTask).filter(SyncTask.id == task_id).first()
 
     def _preflight(self, engine: SyncEngine, source: Database, target: Database) -> None:
-        """启动前校验源库 binlog 与目标库可达性。"""
-        import mysql.connector
+        """启动前校验 binlog 读取库版本、源库 binlog 配置与目标库可达性。"""
+        # 先查依赖库版本：低版本会在连接抖动时崩溃，属于必须挡在门外的硬缺陷。
+        try:
+            assert_reader_lib_sane()
+        except SyncConfigError as exc:
+            raise SyncConfigErrorOut(str(exc)) from exc
 
         try:
-            conn = mysql.connector.connect(
-                host=source.host, port=source.port, user=source.username,
-                password=_decrypt_or_raise(source), connect_timeout=10,
-                connection_timeout=10, ssl_disabled=True,
+            conn = connect_plain_fallback(
+                **build_connect_kwargs(
+                    host=source.host, port=source.port, user=source.username,
+                    password=_decrypt_or_raise(source),
+                )
             )
             conn.close()
         except Exception as exc:
             raise DatabaseConnectionError(f"源数据库连接失败: {exc}") from exc
 
         try:
-            conn = mysql.connector.connect(
-                host=target.host, port=target.port, user=target.username,
-                password=_decrypt_or_raise(target), connect_timeout=10,
-                connection_timeout=10, ssl_disabled=True,
+            conn = connect_plain_fallback(
+                **build_connect_kwargs(
+                    host=target.host, port=target.port, user=target.username,
+                    password=_decrypt_or_raise(target),
+                )
             )
             conn.close()
         except Exception as exc:
@@ -230,12 +254,22 @@ class SyncManager:
             task = db.query(SyncTask).filter(SyncTask.id == task_id).first()
             if task is None:
                 raise NotFoundError("同步任务不存在")
-            if engine is None or not engine.is_running:
+            # 引擎崩溃后线程已不在运行，但库里的状态还是 failed/running。
+            # 若仍按「未在运行即报错」处理，用户就既停不掉、也改不动这个任务——
+            # 只能靠重启进程。这种情况允许清理。
+            crashed = engine is not None and engine.has_failed
+            if not crashed and (engine is None or not engine.is_running):
                 raise BadRequestError("任务未在运行中")
             task_name = task.name
 
+        # 自愈可能在等退避后重启；先取消计数，否则停掉后会被再次拉起。
+        self._recover_counts.pop(task_id, None)
+        self._recover_since.pop(task_id, None)
+        self._recover_pending.pop(task_id, None)
+
         # 停机必须在工作线程外等待，避免阻塞事件循环
-        await asyncio.to_thread(engine.stop)
+        if engine is not None:
+            await asyncio.to_thread(engine.stop)
 
         with self._lock:
             self._engines.pop(task_id, None)
@@ -301,7 +335,7 @@ class SyncManager:
     # ------------------------------------------------------------ 健康汇总
 
     async def refresh_health(self) -> None:
-        """周期性把运行时指标同步进库，供前端展示。"""
+        """周期性刷新指标，并把意外死亡的同步线程拉起来。"""
         with self._lock:
             engines = list(self._engines.items())
 
@@ -311,6 +345,119 @@ class SyncManager:
                     engine._checkpoint.maybe_flush()  # noqa: SLF001
             except Exception as exc:
                 logger.error(f"刷新任务 {task_id} 指标失败: {exc}")
+
+        # 在所有任务指标落盘之后再处理自愈：先让崩溃现场（状态/错误信息）
+        # 写进库，再决定是否重启，否则前端可能永远看不到崩溃原因。
+        await self._recover_dead_tasks(engines)
+
+    async def _recover_dead_tasks(self, engines: List[tuple]) -> None:
+        """
+        检测并重启意外死亡的同步线程。
+
+        「任务处于异常退出、引擎却已不在运行」只有两种可能：
+        线程崩溃，或它从未真正起来。两种情况都需要拉起。
+        正常 stop() 会先把引擎移出注册表，因此不会误判为崩溃。
+        """
+        if not self._running:
+            return
+
+        max_recover = settings.SYNC_AUTO_RECOVER_MAX
+        now = time.monotonic()
+
+        for task_id, engine in engines:
+            if engine.is_running or not engine.has_failed:
+                # 运行正常：累计稳定时长后清空崩溃计数，避免长期运行的任务
+                # 因跨天累计的偶发崩溃而耗尽自愈额度。
+                if engine.is_running:
+                    since = self._recover_since.get(task_id)
+                    if since is not None and now - since >= _RECOVER_RESET_AFTER:
+                        self._recover_counts.pop(task_id, None)
+                        self._recover_since.pop(task_id, None)
+                continue
+
+            # 已有等待中的重启计划：不要重复排队
+            pending = self._recover_pending.get(task_id)
+            if pending is not None:
+                if now < pending:
+                    continue
+                # 到点：交给后台任务执行，本循环立即返回
+                self._recover_pending.pop(task_id, None)
+                self._spawn_recovery(task_id, engine)
+                continue
+
+            count = self._recover_counts.get(task_id, 0)
+            if max_recover <= 0 or count >= max_recover:
+                if count == max_recover:
+                    logger.error(
+                        f"同步任务 {task_id} 已连续崩溃 {count} 次，"
+                        f"达到上限 {max_recover}，停止自动恢复。"
+                        f"最后错误：{engine.last_error}"
+                    )
+                    self._recover_counts[task_id] = count + 1
+                continue
+
+            self._recover_counts[task_id] = count + 1
+
+            delay = min(
+                settings.SYNC_AUTO_RECOVER_DELAY * (2 ** count),
+                settings.SYNC_RETRY_MAX_DELAY,
+            )
+            logger.warning(
+                f"同步任务 {task_id} 异常退出（第 {count + 1}/{max_recover} 次），"
+                f"{delay:.0f}s 后自动恢复。原因：{engine.last_error}"
+            )
+            # 只登记退避截止时刻，不在这里 sleep。
+            # 这是 health 循环共用的协程，一旦在此等待几十秒，
+            # 其他任务的位点落盘与健康刷新会被一起拖住。
+            self._recover_pending[task_id] = now + delay
+
+    def _spawn_recovery(self, task_id: int, engine) -> None:
+        """把一次恢复放到独立任务里执行，避免拖慢健康循环。"""
+
+        async def runner() -> None:
+            try:
+                await self._restart_dead_task(task_id)
+                self._recover_since[task_id] = time.monotonic()
+            except Exception as exc:
+                logger.error(f"自动恢复同步任务 {task_id} 失败: {exc}")
+                with session_scope() as db:
+                    row = db.query(SyncTask).filter(SyncTask.id == task_id).first()
+                    if row:
+                        row.status = SyncStatus.FAILED
+                        row.health = SyncHealth.STALLED
+                        row.error_message = f"自动恢复失败: {exc}"[:1000]
+
+        try:
+            asyncio.get_running_loop().create_task(runner())
+        except RuntimeError:
+            # 无事件循环（如单元测试直接调用）：同步执行，保证行为一致
+            asyncio.run(runner())
+
+    async def _restart_dead_task(self, task_id: int) -> None:
+        """重启一个已崩溃的任务，位点从库中最后已提交处继续。"""
+        with self._lock:
+            self._engines.pop(task_id, None)
+
+        with session_scope() as db:
+            task = db.query(SyncTask).filter(SyncTask.id == task_id).first()
+            if task is None:
+                return
+            task_name = task.name
+            status = task.status
+            # 用户按过停止：状态会被写成 stopped/paused，此时不该复活它。
+            # 崩溃写的是 failed，属于要恢复的情形。
+            if status in (SyncStatus.STOPPED, SyncStatus.PAUSED, SyncStatus.PENDING):
+                logger.info(
+                    f"同步任务 {task_id} 状态为 {status.value}（用户已停止），不再自动恢复"
+                )
+                return
+
+        await self.start_task(task_id)
+        task_log(
+            "sync", task_id, task_name, "WARNING",
+            "同步线程异常退出，已自动恢复（位点从上次提交处继续）",
+        )
+        logger.info(f"同步任务 {task_id} 已自动恢复")
 
 
 sync_manager = SyncManager()

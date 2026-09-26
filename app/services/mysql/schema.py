@@ -14,7 +14,7 @@ from .tools import find_mysql_tool  # noqa: F401  (保持包导出完整)
 from ..sync.sql_builder import TableMeta
 
 _COLUMNS_SQL = """
-    SELECT COLUMN_NAME, EXTRA
+    SELECT COLUMN_NAME, COLUMN_TYPE, EXTRA
     FROM information_schema.COLUMNS
     WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
     ORDER BY ORDINAL_POSITION
@@ -28,6 +28,65 @@ _STATISTICS_SQL = """
 """
 
 _GENERATED_MARKERS = ("VIRTUAL GENERATED", "STORED GENERATED")
+
+
+def _parse_enum_set_labels(column_type: Optional[str]):
+    """
+    解析 information_schema.COLUMNS.COLUMN_TYPE 里的 ENUM/SET 候选值。
+
+    输入形如 ``enum('admin','super')`` 或 ``set('a','b''c')``。
+    返回 ("enum"|"set", 值元组)；不是 ENUM/SET 时返回 None。
+
+    必须自己解析而不是用 split(",")：值里可能含逗号与转义引号
+    （MySQL 把值内的单引号写成两个连续单引号），
+    split 会把 'a,b' 切成两段，造出错误的候选值。
+    """
+    if not column_type:
+        return None
+    text = column_type.strip()
+    lowered = text.lower()
+    if lowered.startswith("enum("):
+        kind = "enum"
+    elif lowered.startswith("set("):
+        kind = "set"
+    else:
+        return None
+
+    inner = text[text.index("(") + 1: text.rindex(")")]
+
+    values: List[str] = []
+    buf: List[str] = []
+    in_quote = False
+    i = 0
+    while i < len(inner):
+        ch = inner[i]
+        if in_quote:
+            if ch == "'":
+                # 连续两个单引号 = 一个字面单引号（MySQL 的转义写法）
+                if i + 1 < len(inner) and inner[i + 1] == "'":
+                    buf.append("'")
+                    i += 2
+                    continue
+                in_quote = False
+            elif ch == "\\" and i + 1 < len(inner):
+                # 反斜杠转义
+                buf.append(inner[i + 1])
+                i += 2
+                continue
+            else:
+                buf.append(ch)
+        else:
+            if ch == "'":
+                in_quote = True
+            elif ch == ",":
+                values.append("".join(buf))
+                buf = []
+        i += 1
+
+    if buf or values:
+        values.append("".join(buf))
+
+    return kind, tuple(values)
 
 
 class SchemaResolver:
@@ -65,10 +124,19 @@ class SchemaResolver:
 
         columns: List[str] = []
         generated = set()
-        for name, extra in column_rows:
+        enum_labels: Dict[str, Tuple[str, ...]] = {}
+        set_labels: Dict[str, Tuple[str, ...]] = {}
+        for name, column_type, extra in column_rows:
             columns.append(name)
             if extra and any(m in extra.upper() for m in _GENERATED_MARKERS):
                 generated.add(name)
+            labels = _parse_enum_set_labels(column_type)
+            if labels is not None:
+                kind, values = labels
+                if kind == "enum":
+                    enum_labels[name] = values
+                else:
+                    set_labels[name] = values
 
         cursor.execute(_STATISTICS_SQL, (meta_schema, table))
         stats = cursor.fetchall()
@@ -97,6 +165,8 @@ class SchemaResolver:
             pk_columns=pk_columns,
             unique_keys=tuple(unique_keys),
             generated_columns=frozenset(generated),
+            enum_labels=enum_labels,
+            set_labels=set_labels,
         )
 
     # ------------------------------------------------------------ 公共接口
